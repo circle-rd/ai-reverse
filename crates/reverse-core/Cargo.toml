@@ -1,0 +1,28 @@
+[package]
+name = "reverse-core"
+description = "Shared types, validation and HTTP plumbing for the reverse tunnel agent and relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

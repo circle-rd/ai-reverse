@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/reverse-core",
+    "crates/reverse-agent",
+]
+# validation/ holds deliberately unversioned crates (see AGENTS.md section 10).
+exclude = ["validation"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/circle-rd/ai-reverse"
+description = "Outbound-only tunnel agent exposing a private inference engine to a relay"
+publish = false
+
+[workspace.dependencies]
+bytes = "1.10.1"
+futures-util = { version = "0.3.31", default-features = false }
+http = "1.3.1"
+http-body-util = "0.1.3"
+hyper = { version = "1.7.0", features = ["http1", "http2", "client", "server"] }
+hyper-util = { version = "0.1.17", features = ["tokio", "client-legacy", "http1"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23.31", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+webpki-roots = "1.0.2"
+zeroize = "1.8.1"
+
+reverse-core = { path = "crates/reverse-core" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true

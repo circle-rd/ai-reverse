@@ -1,0 +1,11 @@
+target/
+data/
+.git/
+.github/
+validation/
+deploy/
+rust-toolchain.toml
+*.md
+!README.md
+.env
+.env.*

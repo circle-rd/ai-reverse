@@ -1,0 +1,26 @@
+# Agent next to a local inference engine. It dials out; it publishes no port.
+# `network_mode: host` lets it reach an engine bound to 127.0.0.1.
+# First start: the agent prints a link and a code (`docker compose logs`); open the link,
+# sign in and approve. The credential is kept in the `agent-state` volume.
+# Non-secret settings come from .env (copy .env.example); the engine key stays in a secret.
+services:
+  reverse-agent:
+    image: ghcr.io/circle-rd/ai-reverse-agent:latest
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    env_file:
+      - .env
+    volumes:
+      - agent-state:/var/lib/reverse-agent
+    secrets:
+      - upstream_api_key
+
+volumes:
+  agent-state:
+
+secrets:
+  upstream_api_key:
+    file: ./secrets/upstream_api_key
