@@ -1,14 +1,38 @@
-# ai-reverse
+<h1 align="center">ai-reverse</h1>
 
-`reverse-agent` is an outbound-only tunnel that exposes a private
-OpenAI-compatible inference engine to a relay, which registers the served
-models in LiteLLM. The engine never accepts an inbound connection: the agent
-dials the relay, upgrades the connection to HTTP/2, and serves the allowlisted
-OpenAI routes through the tunnel.
+<p align="center">
+  <em>Outbound-only tunnel that publishes a private inference engine to LiteLLM.</em>
+</p>
 
-```
-inference engine ──http──> reverse-agent ──reverse-h2/1 over TLS──> reverse-relay ──> LiteLLM
- (127.0.0.1:30001)          (this repository)     (dial-out only)      (maintained separately)
+<p align="center">
+  <a href="https://github.com/circle-rd/ai-reverse/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/circle-rd/ai-reverse/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg"></a>
+  <a href="https://www.rust-lang.org"><img alt="Rust" src="https://img.shields.io/badge/rust-1.89-orange?logo=rust&logoColor=white"></a>
+  <a href="https://github.com/circle-rd/ai-reverse/pkgs/container/ai-reverse-agent"><img alt="Container" src="https://img.shields.io/badge/ghcr.io-ai--reverse--agent-blue?logo=docker&logoColor=white"></a>
+  <a href="deploy/agent/compose.example.yml"><img alt="Docker Compose" src="https://img.shields.io/badge/compose-pull--ready-2496ED?logo=docker&logoColor=white"></a>
+</p>
+
+`reverse-agent` exposes a private OpenAI-compatible inference engine to a relay,
+which registers the served models in LiteLLM. The engine never accepts an
+inbound connection: the agent dials the relay, upgrades the connection to
+HTTP/2, and serves the allowlisted OpenAI routes through the tunnel.
+
+```mermaid
+flowchart LR
+  subgraph box["Inference server — no inbound port"]
+    engine["Inference engine<br/>/v1/models<br/>/v1/chat/completions<br/>/v1/embeddings"]
+    agent["reverse-agent<br/>pairing · discovery · model tags"]
+    engine -->|"http + engine key"| agent
+  end
+
+  hub["Hugging Face API<br/>pipeline_tag"]
+  browser["Browser / OIDC"]
+
+  agent -->|"reverse-h2/1 over TLS<br/>agent dials out"| relay["reverse-relay<br/>tunnel termination"]
+  hub -.->|"model metadata (opt-out)"| agent
+  browser -.->|"pairing approval"| relay
+  relay -->|"/model/new · /model/delete"| litellm["LiteLLM"]
+  litellm -->|"openai-compatible"| clients["Clients"]
 ```
 
 ## Security properties
@@ -19,7 +43,7 @@ inference engine ──http──> reverse-agent ──reverse-h2/1 over TLS─�
   (device-code style flow); the approved credential is persisted with mode
   0600 and forgotten when the relay rejects it.
 - Only the allowlisted OpenAI routes cross the tunnel (`GET /v1/models`,
-  `POST /v1/{chat/completions,completions,embeddings,responses,messages}`);
+  `POST /v1/{chat/completions,completions,embeddings,embedding,responses,messages}`);
   queries are never forwarded.
 - Caller credentials are never forwarded to the engine and the engine key is
   never sent to the relay; the agent injects the engine key itself.
@@ -41,6 +65,10 @@ inference engine ──http──> reverse-agent ──reverse-h2/1 over TLS─�
   on it, or a pre-provisioned `AGENT_TOKEN`.
 - A local OpenAI-compatible engine bound to `127.0.0.1` (or another
   loopback address); TLS to the engine is intentionally unsupported.
+- Optional egress for model classification: with the default
+  `AGENT_HF_METADATA=on`, model ids are sent to the Hugging Face API over
+  HTTPS (`AGENT_HF_URL`). Set it to `off` to keep model ids on the box;
+  `HTTPS_PROXY`/`NO_PROXY` are honored for this lookup.
 
 ## Quickstart (container)
 
@@ -65,8 +93,12 @@ Equivalent plain `docker run`:
 docker run --rm --network host --read-only --cap-drop ALL \
   --security-opt no-new-privileges --ulimit core=0 \
   -v reverse-agent-state:/var/lib/reverse-agent \
-  --env-file .env ghcr.io/circle-rd/ai-reverse-agent:latest
+  --env-file .env \
+  ghcr.io/circle-rd/ai-reverse-agent:latest
 ```
+
+If you uncomment the file form of the engine key, bind-mount it for the plain
+`docker run` too (`-v $PWD/secrets/upstream_api_key:/run/secrets/upstream_api_key:ro`).
 
 ## Configuration
 
@@ -91,12 +123,55 @@ Required settings have no silent defaults. Supplying both `KEY` and
 | `AGENT_IDLE_TIMEOUT_SECS` | no | Body stall limit, both directions. Default 600. |
 | `AGENT_MAX_REQUEST_BYTES` | no | Largest request body accepted. Default 67108864. |
 | `AGENT_INSECURE_TRANSPORT` | no | Allow plain HTTP to a non-loopback relay. Default `false`. |
+| `AGENT_EXTRA_MODELS` | no | Comma-separated ids announced in addition to the engine's `/v1/models`. |
+| `AGENT_MODEL_TAGS` | no | `model=tag[,tag][;…]`; overrides hub metadata for the named models. |
+| `AGENT_HF_METADATA` | no | `on`/`off` (aliases `true`/`false`): consult the hub to classify models. Default `on`. |
+| `AGENT_HF_URL` | no | Hub origin; `https` unless loopback. Default `https://huggingface.co`. |
+| `AGENT_HF_TOKEN` | no | Token for gated or private hub repositories. |
+| `AGENT_HF_TIMEOUT_SECS` | no | Bound on one metadata lookup. Default 5. |
 
 `*` Exactly one of the direct and `_FILE` forms is required when the secret is
 set. Secrets are never echoed in errors or logs.
 
 Plain-text transport to a non-loopback relay is refused unless
 `AGENT_INSECURE_TRANSPORT=true` is set explicitly.
+
+## Model announcement and tags
+
+Every discovered model is announced to the relay with capability tags that
+downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
+
+- **Discovery.** The agent polls the engine's `/v1/models`. Engines commonly
+  omit auxiliary lanes: `AGENT_EXTRA_MODELS` announces ids such as an embedding
+  model the engine serves on `/v1/embeddings` without listing it.
+- **Classification.** The agent asks the Hugging Face model API for the model's
+  `pipeline_tag`, the hub's normalized classification, and maps it to a tag
+  (`feature-extraction` → `embedding`, `text-generation` → `text`,
+  `image-text-to-text` → `text` + `vision`, `text-to-image` → `image`,
+  `automatic-speech-recognition` → `speech`, `text-ranking` → `rerank`, …).
+  Results are cached; unknown or unreachable models are re-checked after 15
+  minutes. One bounded classification pass runs per poll cycle
+  (`AGENT_HF_TIMEOUT_SECS`), so a slow hub can never postpone the announcement
+  of newly discovered models: they are announced first, then enriched.
+- **Override.** `AGENT_MODEL_TAGS` wins over the hub, for internal ids the hub
+  does not know and for facts the hub does not record, like tool calling:
+
+  ```bash
+  AGENT_EXTRA_MODELS=perplexity-ai/pplx-embed-v1-0.6b
+  AGENT_MODEL_TAGS=qwen3.8-flash-next=text,tools
+  ```
+
+- A model with neither hub metadata nor an operator declaration carries **no**
+  tags; the agent logs `models.tags_unknown` instead of guessing.
+- The relay forwards the tags in each LiteLLM deployment's `model_info.tags`
+  and sets `model_info.mode = "embedding"` for embedding models.
+
+Tags: `text`, `tools`, `vision`, `image`, `video`, `speech`, `embedding`,
+`rerank`.
+
+Classification is enrichment, never a serving dependency: a failed lookup or an
+air-gapped box degrades the tags only. With `AGENT_HF_METADATA=off` the agent
+never contacts the hub, so model ids stay on the box.
 
 ## Container images
 

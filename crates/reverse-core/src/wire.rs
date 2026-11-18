@@ -59,6 +59,75 @@ pub struct AgentInfo {
     pub hardware: HardwareInfo,
 }
 
+/// A capability tag used to classify an announced model.
+///
+/// The engine does not expose capabilities, so the agent combines operator declarations with
+/// the hub's `pipeline_tag` metadata; models with neither carry no tags. Downstream consumers
+/// receive these tags through the relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelTag {
+    /// Text generation.
+    Text,
+    /// Tool / function calling.
+    Tools,
+    /// Image understanding.
+    Vision,
+    /// Image generation.
+    Image,
+    /// Video generation or understanding.
+    Video,
+    /// Speech recognition or synthesis.
+    Speech,
+    /// Embedding vectors.
+    Embedding,
+    /// Reranking.
+    Rerank,
+}
+
+impl ModelTag {
+    /// Parses a tag written in kebab-case.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "text" => Some(Self::Text),
+            "tools" => Some(Self::Tools),
+            "vision" => Some(Self::Vision),
+            "image" => Some(Self::Image),
+            "video" => Some(Self::Video),
+            "speech" => Some(Self::Speech),
+            "embedding" => Some(Self::Embedding),
+            "rerank" => Some(Self::Rerank),
+            _ => None,
+        }
+    }
+
+    /// The kebab-case spelling used on the wire and in configuration files.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Tools => "tools",
+            Self::Vision => "vision",
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::Speech => "speech",
+            Self::Embedding => "embedding",
+            Self::Rerank => "rerank",
+        }
+    }
+}
+
+/// One model the agent announces to the relay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelEntry {
+    /// Model id exactly as the engine (or the operator) reports it.
+    pub id: String,
+    /// Capability tags, sorted and deduplicated.
+    pub tags: Vec<ModelTag>,
+}
+
 /// What the inference engine serves right now, as seen by the agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,8 +136,8 @@ pub struct ModelsSnapshot {
     pub revision: u64,
     /// Whether the last poll of the engine succeeded.
     pub engine_available: bool,
-    /// Model ids reported by the engine.
-    pub models: Vec<String>,
+    /// Models announced by the agent, including configured extras.
+    pub models: Vec<ModelEntry>,
 }
 
 impl ModelsSnapshot {
@@ -94,6 +163,56 @@ mod tests {
             json,
             r#"{"revision":0,"engineAvailable":false,"models":[]}"#
         );
+    }
+
+    #[test]
+    fn a_model_entry_carries_kebab_case_tags() {
+        let entry = ModelEntry {
+            id: "perplexity-ai/pplx-embed-v1-0.6b".to_owned(),
+            tags: vec![ModelTag::Embedding],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":"perplexity-ai/pplx-embed-v1-0.6b","tags":["embedding"]}"#
+        );
+        assert_eq!(serde_json::from_str::<ModelEntry>(&json).unwrap(), entry);
+    }
+
+    #[test]
+    fn tags_round_trip_through_their_wire_spelling() {
+        for tag in [
+            ModelTag::Text,
+            ModelTag::Tools,
+            ModelTag::Vision,
+            ModelTag::Image,
+            ModelTag::Video,
+            ModelTag::Speech,
+            ModelTag::Embedding,
+            ModelTag::Rerank,
+        ] {
+            assert_eq!(ModelTag::parse(tag.as_str()), Some(tag));
+        }
+        assert_eq!(ModelTag::parse("embeddings"), None);
+    }
+
+    #[test]
+    fn serde_and_the_config_spelling_cannot_drift() {
+        for tag in [
+            ModelTag::Text,
+            ModelTag::Tools,
+            ModelTag::Vision,
+            ModelTag::Image,
+            ModelTag::Video,
+            ModelTag::Speech,
+            ModelTag::Embedding,
+            ModelTag::Rerank,
+        ] {
+            let json = serde_json::to_string(&tag).unwrap();
+            assert_eq!(json, format!("\"{}\"", tag.as_str()));
+            let parsed: ModelTag = serde_json::from_str(&json).unwrap();
+            assert_eq!(ModelTag::parse(parsed.as_str()), Some(parsed));
+        }
     }
 
     #[test]

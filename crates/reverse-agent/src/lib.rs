@@ -1,5 +1,6 @@
 //! Reverse tunnel agent: exposes a local OpenAI-compatible engine to a relay without any inbound port.
 
+pub mod catalog;
 pub mod config;
 pub mod credential;
 pub mod discovery;
@@ -18,6 +19,7 @@ use tokio::sync::watch;
 
 pub use config::Config;
 
+use crate::catalog::Catalog;
 use crate::proxy::AgentState;
 use crate::upstream::Upstream;
 
@@ -36,9 +38,35 @@ pub async fn run(config: Config, shutdown: watch::Receiver<bool>) {
         idle_timeout: config.idle_timeout,
     });
 
+    let catalog = if config.hf_enabled {
+        match Catalog::new(&config) {
+            Ok(catalog) => {
+                tracing::info!(
+                    hub = %config.hf_url.origin(),
+                    "catalog.enabled; model ids are sent to the hub, AGENT_HF_METADATA=off keeps them local"
+                );
+                Some(Arc::new(catalog))
+            }
+            Err(error) => {
+                tracing::error!(%error, "catalog.init_failed");
+                None
+            }
+        }
+    } else {
+        tracing::debug!("catalog.disabled");
+        None
+    };
+    let declared = discovery::Declared {
+        extras: config.extra_models.clone(),
+        tags: config.model_tags.clone(),
+    };
+
     let discovery = tokio::spawn(discovery::run(
         upstream,
         config.models_poll,
+        declared,
+        catalog,
+        config.hf_timeout,
         snapshots,
         shutdown.clone(),
     ));
