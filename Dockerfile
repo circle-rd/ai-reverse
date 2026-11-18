@@ -6,8 +6,9 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/reverse-core/Cargo.toml crates/reverse-core/Cargo.toml
 COPY crates/reverse-agent/Cargo.toml crates/reverse-agent/Cargo.toml
-RUN mkdir -p crates/reverse-core/src crates/reverse-agent/src \
-    && touch crates/reverse-core/src/lib.rs crates/reverse-agent/src/lib.rs \
+COPY crates/reverse-relay/Cargo.toml crates/reverse-relay/Cargo.toml
+RUN mkdir -p crates/reverse-core/src crates/reverse-agent/src crates/reverse-relay/src \
+    && touch crates/reverse-core/src/lib.rs crates/reverse-agent/src/lib.rs crates/reverse-relay/src/lib.rs \
     && echo 'fn main() {}' > crates/reverse-agent/src/main.rs \
     && cargo build --release --locked -p reverse-agent
 RUN rm -rf crates

@@ -7,6 +7,8 @@ use thiserror::Error;
 const MIN_CLIENT_ID_LEN: usize = 2;
 const MAX_CLIENT_ID_LEN: usize = 63;
 const MAX_MODEL_NAME_LEN: usize = 128;
+/// Length of the hex-encoded agent id agents present when opening a tunnel.
+pub const AGENT_ID_LEN: usize = 16;
 
 /// LiteLLM parses `provider/model` prefixes, so a client id equal to a provider name could be
 /// routed to that provider; the last three collide with relay paths.
@@ -72,6 +74,12 @@ pub enum IdError {
     /// The model name contains a forbidden character or path pattern.
     #[error("model name has a forbidden character or path pattern")]
     ModelNameCharset,
+    /// The agent id is not exactly [`AGENT_ID_LEN`] characters.
+    #[error("agent id must be {AGENT_ID_LEN} hexadecimal characters")]
+    AgentIdLength,
+    /// The agent id contains a forbidden character.
+    #[error("agent id must be lowercase hexadecimal")]
+    AgentIdCharset,
 }
 
 /// Namespace prefix of every model an agent serves.
@@ -107,6 +115,40 @@ impl ClientId {
 }
 
 impl fmt::Display for ClientId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A stable per-agent identifier, self-generated at first enrolment.
+///
+/// It distinguishes several agents of the same account without appearing in a model alias.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentId(String);
+
+impl AgentId {
+    /// Validates a raw agent id.
+    pub fn parse(raw: &str) -> Result<Self, IdError> {
+        if raw.len() != AGENT_ID_LEN {
+            return Err(IdError::AgentIdLength);
+        }
+        if !raw
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(IdError::AgentIdCharset);
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    /// The validated identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AgentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
@@ -207,6 +249,20 @@ mod tests {
         assert_eq!(
             ModelName::parse(&"x".repeat(129)),
             Err(IdError::ModelNameLength)
+        );
+    }
+
+    #[test]
+    fn agent_ids_are_16_lowercase_hex_characters() {
+        assert!(AgentId::parse("0123456789abcdef").is_ok());
+        assert_eq!(AgentId::parse("0123"), Err(IdError::AgentIdLength));
+        assert_eq!(
+            AgentId::parse("0123456789ABCDEf"),
+            Err(IdError::AgentIdCharset)
+        );
+        assert_eq!(
+            AgentId::parse("0123456789abcde-"),
+            Err(IdError::AgentIdCharset)
         );
     }
 }

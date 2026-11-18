@@ -21,16 +21,19 @@ HTTP/2, and serves the allowlisted OpenAI routes through the tunnel.
 flowchart LR
   subgraph box["Inference server — no inbound port"]
     engine["Inference engine<br/>/v1/models<br/>/v1/chat/completions<br/>/v1/embeddings"]
-    agent["reverse-agent<br/>pairing · discovery · model tags"]
+    agent["reverse-agent<br/>device flow · discovery · model tags"]
     engine -->|"http + engine key"| agent
   end
 
   hub["Hugging Face API<br/>pipeline_tag"]
-  browser["Browser / OIDC"]
+  auth["AuthService<br/>OIDC · JWKS · device flow"]
+  browser["Browser"]
 
   agent -->|"reverse-h2/1 over TLS<br/>agent dials out"| relay["reverse-relay<br/>tunnel termination"]
   hub -.->|"model metadata (opt-out)"| agent
-  browser -.->|"pairing approval"| relay
+  agent -->|"device flow · token refresh"| auth
+  relay -->|"discovery · JWKS"| auth
+  browser -.->|"device approval"| auth
   relay -->|"/model/new · /model/delete"| litellm["LiteLLM"]
   litellm -->|"openai-compatible"| clients["Clients"]
 ```
@@ -39,9 +42,13 @@ flowchart LR
 
 - The agent opens no listener and publishes no port; every connection is
   outbound, initiated by the agent.
-- First run pairs the agent with the relay through a browser approval
-  (device-code style flow); the approved credential is persisted with mode
-  0600 and forgotten when the relay rejects it.
+- The agent authorizes itself through the AuthService device flow: a human
+  approves a short-lived code in the browser, the refresh token and agent id
+  are persisted with mode 0600, and they are forgotten when the identity
+  provider stops accepting them.
+- The relay verifies AuthService-issued access tokens offline against the
+  published JWKS; tokens must carry the relay URL as audience and the
+  `tunnel:serve` scope. The relay never issues credentials of its own.
 - Only the allowlisted OpenAI routes cross the tunnel (`GET /v1/models`,
   `POST /v1/{chat/completions,completions,embeddings,embedding,responses,messages}`);
   queries are never forwarded.
@@ -61,13 +68,14 @@ flowchart LR
 ## Requirements
 
 - Rust 1.89 (pinned in `rust-toolchain.toml`), edition 2024, for local builds.
-- A reachable relay (the broker side is maintained separately) and an account
-  on it, or a pre-provisioned `AGENT_TOKEN`.
+- A reachable relay (shipped by this repository), an AuthService account and a
+  `reverse-agent` OAuth client registered for the device flow with the
+  `tunnel:serve` scope and the relay URL as its resource.
 - A local OpenAI-compatible engine bound to `127.0.0.1` (or another
   loopback address); TLS to the engine is intentionally unsupported.
 - Optional egress for model classification: with the default
-  `AGENT_HF_METADATA=on`, model ids are sent to the Hugging Face API over
-  HTTPS (`AGENT_HF_URL`). Set it to `off` to keep model ids on the box;
+  `AGENT_HF_METADATA=true` by default, model ids are sent to the Hugging Face
+  API over HTTPS (`AGENT_HF_URL`). Set it to `false` to keep model ids on the box;
   `HTTPS_PROXY`/`NO_PROXY` are honored for this lookup.
 
 ## Quickstart (container)
@@ -83,9 +91,9 @@ docker compose up -d
 docker compose logs -f reverse-agent
 ```
 
-On the first start without `AGENT_TOKEN`, the agent prints a verification link
-and a user code; open the link, sign in and approve. The credential is then
-kept in the `agent-state` volume and reused across restarts.
+On the first start the agent begins the device flow and prints a verification
+link and a user code; open the link, sign in and approve. The refresh token and
+the agent id are kept in the `agent-state` volume and reused across restarts.
 
 Equivalent plain `docker run`:
 
@@ -110,11 +118,13 @@ Required settings have no silent defaults. Supplying both `KEY` and
 | --- | --- | --- |
 | `AGENT_RELAY_URL` | yes | Relay origin, `http(s)://host[:port]`. `https` in production. |
 | `AGENT_UPSTREAM_URL` | yes | Local engine origin; `https` is rejected, plain `http` only. |
-| `AGENT_TOKEN` | no* | Pre-provisioned agent credential. |
+| `AGENT_AUTH_ISSUER` | yes | AuthService origin, `https` in production (loopback may be `http`). |
+| `AGENT_AUTH_CLIENT_ID` | yes | OAuth client registered for the device flow. |
+| `AGENT_AUTH_RESOURCE` | no | Audience requested for the access token. Default: the relay origin. |
+| `AGENT_AUTH_SCOPE` | no | Scopes requested at authorization. Default `openid profile offline_access tunnel:serve`. |
 | `AGENT_UPSTREAM_API_KEY` | no* | Engine bearer key. |
 | `AGENT_UPSTREAM_API_KEY_FILE` | no* | File alternative; exactly one form per secret. |
-| `AGENT_LABEL` | no | Name shown to the person approving the pairing. Default `agent`. |
-| `AGENT_CREDENTIAL_FILE` | no | Where the paired credential is kept. Default `/var/lib/reverse-agent/credential`. |
+| `AGENT_CREDENTIAL_FILE` | no | Where the refresh token and agent id are kept. Default `/var/lib/reverse-agent/credential`. |
 | `AGENT_MODELS_POLL_SECS` | no | Interval between engine model-list polls. Default 5. |
 | `AGENT_RECONNECT_MIN_SECS` | no | First reconnect delay. Default 1. |
 | `AGENT_RECONNECT_MAX_SECS` | no | Reconnect delay ceiling. Default 30. |
@@ -125,7 +135,7 @@ Required settings have no silent defaults. Supplying both `KEY` and
 | `AGENT_INSECURE_TRANSPORT` | no | Allow plain HTTP to a non-loopback relay. Default `false`. |
 | `AGENT_EXTRA_MODELS` | no | Comma-separated ids announced in addition to the engine's `/v1/models`. |
 | `AGENT_MODEL_TAGS` | no | `model=tag[,tag][;…]`; overrides hub metadata for the named models. |
-| `AGENT_HF_METADATA` | no | `on`/`off` (aliases `true`/`false`): consult the hub to classify models. Default `on`. |
+| `AGENT_HF_METADATA` | no | `true`/`false`: consult the hub to classify models. Default `true`. |
 | `AGENT_HF_URL` | no | Hub origin; `https` unless loopback. Default `https://huggingface.co`. |
 | `AGENT_HF_TOKEN` | no | Token for gated or private hub repositories. |
 | `AGENT_HF_TIMEOUT_SECS` | no | Bound on one metadata lookup. Default 5. |
@@ -170,7 +180,7 @@ Tags: `text`, `tools`, `vision`, `image`, `video`, `speech`, `embedding`,
 `rerank`.
 
 Classification is enrichment, never a serving dependency: a failed lookup or an
-air-gapped box degrades the tags only. With `AGENT_HF_METADATA=off` the agent
+air-gapped box degrades the tags only. With `AGENT_HF_METADATA=false` the agent
 never contacts the hub, so model ids stay on the box.
 
 ## Container images
@@ -214,12 +224,13 @@ pinned to 1.89.0 in `rust-toolchain.toml`.
 crates/
 ├── reverse-core/    # wire contract, validated identifiers, env parsing,
 │                    # secrets, bounded bodies, tunnel allowlist, logging, shutdown
-└── reverse-agent/   # binary: pairing, tunnel, discovery, proxy, engine client
+├── reverse-agent/   # binary: device flow, tunnel, discovery, proxy, engine client
+└── reverse-relay/   # binary: tunnel termination, token verification, model registrar
 deploy/agent/        # pull-based compose example + .env.example
 ```
 
-The relay crate, the LiteLLM PoC recipes and the local development stacks live
-in the ignored `validation/` directory; see [AGENTS.md](AGENTS.md) section 10.
+The LiteLLM PoC recipes and the local development stacks live in the ignored
+`validation/` directory; see [AGENTS.md](AGENTS.md) section 10.
 
 ## License
 

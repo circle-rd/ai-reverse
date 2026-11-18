@@ -8,6 +8,9 @@ pub const TUNNEL_PROTOCOL: &str = "reverse-h2/1";
 /// Path the agent dials to open a tunnel.
 pub const TUNNEL_PATH: &str = "/tunnel";
 
+/// Header of the upgrade request naming the agent instance (`AgentId`).
+pub const AGENT_ID_HEADER: &str = "x-agent-id";
+
 /// Path the relay polls through the tunnel to learn which models are served.
 pub const AGENT_MODELS_PATH: &str = "/_agent/models";
 

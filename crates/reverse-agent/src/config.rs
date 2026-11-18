@@ -8,7 +8,6 @@ use reverse_core::config::{BaseUrl, ConfigError, Env};
 use reverse_core::ids::ModelName;
 use reverse_core::secret::SecretString;
 use reverse_core::wire::ModelTag;
-
 const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_CREDENTIAL_FILE: &str = "/var/lib/reverse-agent/credential";
 const DEFAULT_HF_URL: &str = "https://huggingface.co";
@@ -18,12 +17,16 @@ const DEFAULT_HF_URL: &str = "https://huggingface.co";
 pub struct Config {
     /// Where to dial the tunnel.
     pub relay: BaseUrl,
-    /// A pre-provisioned credential; when absent the agent pairs with the relay.
-    pub token: Option<SecretString>,
-    /// Where the credential obtained by pairing is kept.
+    /// Identity provider that issues the agent's access tokens (CIRCLE auth-service).
+    pub auth_issuer: BaseUrl,
+    /// OAuth client registered for this agent.
+    pub auth_client_id: String,
+    /// Audience requested for the token: the relay's public URL.
+    pub auth_resource: BaseUrl,
+    /// Space-separated scopes requested at authorization.
+    pub auth_scope: String,
+    /// Where the refresh token and agent id are kept.
     pub credential_file: PathBuf,
-    /// Name shown to the person approving the pairing.
-    pub label: String,
     /// The local OpenAI-compatible engine.
     pub upstream: BaseUrl,
     /// Bearer key the engine requires, if any.
@@ -82,6 +85,45 @@ impl Config {
             }
         }
 
+        let auth_issuer = BaseUrl::parse("AGENT_AUTH_ISSUER", &env.required("AGENT_AUTH_ISSUER")?)?;
+        if auth_issuer.scheme() != &http::uri::Scheme::HTTPS
+            && !auth_issuer.is_loopback()
+            && !insecure
+        {
+            return Err(ConfigError::invalid(
+                "AGENT_AUTH_ISSUER",
+                "plain-text transport to a non-loopback host requires AGENT_INSECURE_TRANSPORT=true",
+            ));
+        }
+        let auth_client_id = env.required("AGENT_AUTH_CLIENT_ID")?;
+        if auth_client_id.is_empty()
+            || auth_client_id.len() > 128
+            || !auth_client_id.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(ConfigError::invalid(
+                "AGENT_AUTH_CLIENT_ID",
+                "expected 1 to 128 printable ASCII characters",
+            ));
+        }
+        let auth_resource = BaseUrl::parse(
+            "AGENT_AUTH_RESOURCE",
+            &env.optional("AGENT_AUTH_RESOURCE")?
+                .unwrap_or_else(|| relay.origin()),
+        )?;
+        let auth_scope = env
+            .optional("AGENT_AUTH_SCOPE")?
+            .unwrap_or_else(|| "openid profile offline_access tunnel:serve".to_owned());
+        if auth_scope.is_empty()
+            || !auth_scope
+                .bytes()
+                .all(|b| b == b' ' || b.is_ascii_graphic())
+        {
+            return Err(ConfigError::invalid(
+                "AGENT_AUTH_SCOPE",
+                "expected space-separated scope tokens",
+            ));
+        }
+
         let reconnect_min = env.duration_secs("AGENT_RECONNECT_MIN_SECS", 1)?;
         let reconnect_max = env.duration_secs("AGENT_RECONNECT_MAX_SECS", 30)?;
         if reconnect_min > reconnect_max {
@@ -92,12 +134,12 @@ impl Config {
         }
 
         let hf_enabled = match env.optional("AGENT_HF_METADATA")?.as_deref() {
-            None | Some("on") | Some("true") => true,
-            Some("off") | Some("false") => false,
+            None | Some("true") => true,
+            Some("false") => false,
             Some(_) => {
                 return Err(ConfigError::invalid(
                     "AGENT_HF_METADATA",
-                    "expected on/off (true/false)",
+                    "expected true/false",
                 ));
             }
         };
@@ -115,14 +157,14 @@ impl Config {
 
         Ok(Self {
             relay,
-            token: env.secret("AGENT_TOKEN")?,
+            auth_issuer,
+            auth_client_id,
+            auth_resource,
+            auth_scope,
             credential_file: PathBuf::from(
                 env.optional("AGENT_CREDENTIAL_FILE")?
                     .unwrap_or_else(|| DEFAULT_CREDENTIAL_FILE.to_owned()),
             ),
-            label: env
-                .optional("AGENT_LABEL")?
-                .unwrap_or_else(|| "agent".to_owned()),
             upstream,
             upstream_api_key: env.secret("AGENT_UPSTREAM_API_KEY")?,
             models_poll: env.duration_secs("AGENT_MODELS_POLL_SECS", 5)?,
@@ -220,9 +262,11 @@ mod tests {
         Config::from_env(&Env::new(move |key| map.get(key).cloned()))
     }
 
-    const BASE: [(&str, &str); 2] = [
+    const BASE: [(&str, &str); 4] = [
         ("AGENT_RELAY_URL", "http://127.0.0.1:8443"),
         ("AGENT_UPSTREAM_URL", "http://127.0.0.1:30001"),
+        ("AGENT_AUTH_ISSUER", "http://127.0.0.1:9000"),
+        ("AGENT_AUTH_CLIENT_ID", "reverse-agent"),
     ];
 
     fn with(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
@@ -234,14 +278,21 @@ mod tests {
     #[test]
     fn loads_a_minimal_loopback_setup() {
         let cfg = load(&BASE).unwrap();
-        assert!(cfg.token.is_none());
         assert!(cfg.upstream_api_key.is_none());
+        assert_eq!(cfg.auth_client_id, "reverse-agent");
+        assert_eq!(cfg.auth_resource.origin(), "http://127.0.0.1:8443");
+        assert_eq!(cfg.auth_scope, "openid profile offline_access tunnel:serve");
     }
 
     #[test]
-    fn a_static_token_comes_from_the_environment() {
-        let cfg = load(&with(&[("AGENT_TOKEN", "rvr_x")])).unwrap();
-        assert_eq!(cfg.token.unwrap().expose(), "rvr_x");
+    fn the_audience_can_be_overridden_and_the_client_id_is_validated() {
+        let cfg = load(&with(&[(
+            "AGENT_AUTH_RESOURCE",
+            "https://relay.example.com",
+        )]))
+        .unwrap();
+        assert_eq!(cfg.auth_resource.origin(), "https://relay.example.com");
+        assert!(load(&with(&[("AGENT_AUTH_CLIENT_ID", "bad id")])).is_err());
     }
 
     #[test]
@@ -251,7 +302,12 @@ mod tests {
 
     #[test]
     fn plain_text_to_a_remote_relay_needs_an_explicit_flag() {
-        let mut pairs = vec![BASE[1], ("AGENT_RELAY_URL", "http://relay.lan:8443")];
+        let mut pairs = vec![
+            BASE[1],
+            BASE[2],
+            BASE[3],
+            ("AGENT_RELAY_URL", "http://relay.lan:8443"),
+        ];
         assert!(load(&pairs).is_err());
         pairs.push(("AGENT_INSECURE_TRANSPORT", "true"));
         assert!(load(&pairs).is_ok());
@@ -259,9 +315,19 @@ mod tests {
 
     #[test]
     fn tls_is_accepted_for_the_relay_but_not_the_engine() {
-        let relay = [BASE[1], ("AGENT_RELAY_URL", "https://broker.example.com")];
+        let relay = [
+            BASE[1],
+            BASE[2],
+            BASE[3],
+            ("AGENT_RELAY_URL", "https://broker.example.com"),
+        ];
         assert!(load(&relay).is_ok());
-        let engine = [BASE[0], ("AGENT_UPSTREAM_URL", "https://127.0.0.1:30001")];
+        let engine = [
+            BASE[0],
+            BASE[2],
+            BASE[3],
+            ("AGENT_UPSTREAM_URL", "https://127.0.0.1:30001"),
+        ];
         assert!(load(&engine).is_err());
     }
 
@@ -309,13 +375,8 @@ mod tests {
     }
 
     #[test]
-    fn the_hub_is_on_by_default_and_can_be_disabled() {
+    fn the_hub_is_enabled_by_default_and_can_be_disabled() {
         assert!(load(&BASE).unwrap().hf_enabled);
-        assert!(
-            !load(&with(&[("AGENT_HF_METADATA", "off")]))
-                .unwrap()
-                .hf_enabled
-        );
         assert!(
             !load(&with(&[("AGENT_HF_METADATA", "false")]))
                 .unwrap()
@@ -327,6 +388,8 @@ mod tests {
                 .hf_enabled
         );
         assert!(load(&with(&[("AGENT_HF_METADATA", "maybe")])).is_err());
+        assert!(load(&with(&[("AGENT_HF_METADATA", "on")])).is_err());
+        assert!(load(&with(&[("AGENT_HF_METADATA", "off")])).is_err());
         assert_eq!(
             load(&BASE).unwrap().hf_url.origin(),
             "https://huggingface.co"

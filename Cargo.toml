@@ -3,8 +3,9 @@ resolver = "3"
 members = [
     "crates/reverse-core",
     "crates/reverse-agent",
+    "crates/reverse-relay",
 ]
-# validation/ holds deliberately unversioned crates (see AGENTS.md section 10).
+# validation/ holds deliberately unversioned stacks (see AGENTS.md section 10).
 exclude = ["validation"]
 
 [workspace.package]
@@ -17,26 +18,35 @@ description = "Outbound-only tunnel agent exposing a private inference engine to
 publish = false
 
 [workspace.dependencies]
+base64 = "0.22.1"
 bytes = "1.10.1"
 futures-util = { version = "0.3.31", default-features = false }
+getrandom = "0.3.3"
 http = "1.3.1"
 http-body-util = "0.1.3"
+jsonwebtoken = "9.3.1"
 hyper = { version = "1.7.0", features = ["http1", "http2", "client", "server"] }
 hyper-util = { version = "0.1.17", features = ["tokio", "client-legacy", "http1"] }
+maxminddb = { version = "0.33.0", default-features = false }
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.23.31", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+sha2 = "0.10.9"
+subtle = "2.6.1"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+url = { version = "2.5.7", features = ["serde"] }
 webpki-roots = "1.0.2"
 zeroize = "1.8.1"
 
 reverse-core = { path = "crates/reverse-core" }
+reverse-agent = { path = "crates/reverse-agent" }
+reverse-relay = { path = "crates/reverse-relay" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

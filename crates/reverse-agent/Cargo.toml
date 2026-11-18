@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 bytes.workspace = true
+getrandom.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
