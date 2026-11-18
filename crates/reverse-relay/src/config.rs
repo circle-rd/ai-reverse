@@ -25,7 +25,7 @@ pub struct Config {
     pub litellm_management_uses_master: bool,
     /// Origin of the tunnel listener as agents and the identity provider see it, without slash.
     pub public_url: String,
-    /// Base LiteLLM uses to reach `api_listen`, without trailing slash; may carry a path prefix.
+    /// Origin LiteLLM uses to reach `api_listen`, without trailing slash.
     pub public_api_base: String,
     /// Bearer key LiteLLM presents to `api_listen`.
     pub api_key: SecretString,

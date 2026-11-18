@@ -177,7 +177,7 @@ Plain-text transport to a non-loopback relay is refused unless
 | `RELAY_TUNNEL_LISTEN` | yes | `ip:port` where agents dial the tunnel. |
 | `RELAY_API_LISTEN` | yes | `ip:port` of the OpenAI surface LiteLLM calls; never publish it. |
 | `RELAY_PUBLIC_URL` | yes | Public tunnel origin as agents and the identity provider see it. |
-| `RELAY_PUBLIC_API_BASE` | yes | Base URL LiteLLM uses to reach `RELAY_API_LISTEN`, may carry a path prefix. |
+| `RELAY_PUBLIC_API_BASE` | yes | Origin LiteLLM uses to reach `RELAY_API_LISTEN`; the relay appends `/{account}/…`. |
 | `RELAY_API_KEY` | yes* | Bearer key LiteLLM presents; injected into registered deployments. |
 | `RELAY_AUTH_ISSUER` | yes | AuthService origin issuing agent tokens. |
 | `RELAY_AUTH_AUDIENCE` | no | Required token audience. Default: `RELAY_PUBLIC_URL`. |
