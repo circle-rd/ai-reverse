@@ -245,6 +245,15 @@ impl Registry {
         self.lock().tunnels.contains_key(client)
     }
 
+    /// How many tunnels the client currently holds open.
+    #[must_use]
+    pub fn tunnel_count(&self, client: &ClientId) -> usize {
+        self.lock()
+            .tunnels
+            .get(client)
+            .map_or(0, |tunnels| tunnels.len())
+    }
+
     /// The route to one of the client's nodes, counting the request as in flight.
     ///
     /// A node serving `model` is preferred; before any node reported its models, or when none

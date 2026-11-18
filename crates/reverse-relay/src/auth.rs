@@ -421,6 +421,13 @@ mod tests {
     }
 
     #[test]
+    fn errors_never_echo_the_credential() {
+        let error = jsonwebtoken::decode_header("sentinel-token").unwrap_err();
+        let wrapped = AuthError::Header(error);
+        assert!(!wrapped.to_string().contains("sentinel-token"));
+    }
+
+    #[test]
     fn the_agent_id_header_must_be_present_and_valid() {
         let headers = HeaderMap::new();
         let runtime = tokio::runtime::Builder::new_current_thread()

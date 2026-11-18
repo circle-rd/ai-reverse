@@ -49,6 +49,12 @@ flowchart LR
 - The relay verifies AuthService-issued access tokens offline against the
   published JWKS; tokens must carry the relay URL as audience and the
   `tunnel:serve` scope. The relay never issues credentials of its own.
+- Failed tunnel authentications are counted per client address in a bounded
+  state; past the threshold the address is locked out with an `Retry-After`,
+  and lockouts double (bounded) on repeat offences while a success clears the
+  record. `X-Forwarded-For` is trusted only with `RELAY_TRUST_FORWARDED_FOR`.
+- Tunnels are capped globally (`RELAY_MAX_TUNNELS`) and per account
+  (`RELAY_MAX_TUNNELS_PER_USER`); both answer `429` without touching the agent.
 - Only the allowlisted OpenAI routes cross the tunnel (`GET /v1/models`,
   `POST /v1/{chat/completions,completions,embeddings,embedding,responses,messages}`);
   queries are never forwarded.

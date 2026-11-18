@@ -43,6 +43,15 @@ pub struct FakeEngine {
 }
 
 impl FakeEngine {
+    /// A handle that shares this engine without owning its task.
+    pub fn shared(&self) -> Self {
+        Self {
+            addr: self.addr,
+            state: self.state.clone(),
+            task: tokio::spawn(async {}),
+        }
+    }
+
     pub async fn start(key: &str, models: &[&str]) -> Self {
         let state = Arc::new(EngineState {
             models: Mutex::new(models.iter().map(|m| (*m).to_owned()).collect()),

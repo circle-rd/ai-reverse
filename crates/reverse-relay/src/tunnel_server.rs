@@ -1,9 +1,9 @@
 //! Accepts agent tunnels: HTTP/1.1 upgrade, verified token, then HTTP/2 to the agent.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http::{HeaderMap, Method, Request, Response, StatusCode, header};
 use hyper::body::Incoming;
@@ -18,6 +18,7 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::auth::{AuthState, Identity};
 use crate::error::TunnelError;
+use crate::limiter::{Decision, FailureLimiter};
 use crate::registry::Registry;
 use crate::watcher;
 
@@ -36,8 +37,26 @@ pub struct TunnelState {
     pub poll_timeout: Duration,
     /// Cap on concurrently upgraded tunnels.
     pub limit: Arc<Semaphore>,
+    /// Locks out addresses that keep failing to authenticate.
+    pub limiter: Arc<FailureLimiter>,
+    /// Cap on concurrently upgraded tunnels of one account.
+    pub max_tunnels_per_user: usize,
+    /// Whether the last `X-Forwarded-For` entry is the client address.
+    pub trust_forwarded_for: bool,
     /// Stops every tunnel on shutdown.
     pub shutdown: watch::Receiver<bool>,
+}
+
+/// The caller's address, from the proxy header when a trusted proxy sits in front.
+fn client_ip(peer: SocketAddr, headers: &HeaderMap, trust_forwarded_for: bool) -> IpAddr {
+    if trust_forwarded_for
+        && let Some(forwarded) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+        && let Some(last) = forwarded.rsplit(',').next()
+        && let Ok(address) = last.trim().parse()
+    {
+        return address;
+    }
+    peer.ip()
 }
 
 fn wants_tunnel_upgrade(headers: &HeaderMap) -> bool {
@@ -74,10 +93,17 @@ pub async fn handle(
             "this endpoint only speaks the reverse tunnel protocol",
         ));
     }
+    let address = client_ip(peer, request.headers(), state.trust_forwarded_for);
+    let now = Instant::now();
+    if let Decision::Blocked(wait) = state.limiter.check(address, now) {
+        tracing::warn!(%address, "tunnel.rejected_lockout");
+        return Ok(too_many(wait));
+    }
     let identity = match state.auth.authenticate(request.headers()).await {
         Ok(identity) => identity,
         Err(error) => {
-            tracing::warn!(%peer, reason = %error, "tunnel.rejected_credentials");
+            state.limiter.failure(address, Instant::now());
+            tracing::warn!(%peer, %address, reason = %error, "tunnel.rejected_credentials");
             let mut response = error_response(
                 StatusCode::UNAUTHORIZED,
                 "invalid_token",
@@ -90,6 +116,15 @@ pub async fn handle(
             return Ok(response);
         }
     };
+    state.limiter.success(address);
+    if state.registry.tunnel_count(&identity.username) >= state.max_tunnels_per_user {
+        tracing::warn!(
+            user = %identity.username,
+            %peer,
+            "tunnel.rejected_account_capacity"
+        );
+        return Ok(too_many(Duration::from_secs(30)));
+    }
     let Ok(permit) = state.limit.clone().try_acquire_owned() else {
         tracing::warn!(%peer, "tunnel.rejected_capacity");
         return Ok(error_response(
@@ -131,6 +166,22 @@ pub async fn handle(
         header::HeaderValue::from_static(TUNNEL_PROTOCOL),
     );
     Ok(response)
+}
+
+/// Answers 429 with the delay the caller should wait.
+fn too_many(wait: Duration) -> Response<ProxyBody> {
+    let seconds = wait.as_secs().clamp(1, u32::MAX as u64);
+    let mut response = error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        "too many failed attempts or tunnels; retry later",
+    );
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        header::HeaderValue::from_str(&seconds.to_string())
+            .unwrap_or_else(|_| header::HeaderValue::from_static("60")),
+    );
+    response
 }
 
 async fn run_tunnel(
@@ -183,6 +234,26 @@ mod tests {
             );
         }
         map
+    }
+
+    #[test]
+    fn the_forwarded_for_header_is_used_only_when_trusted() {
+        let peer: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            header::HeaderValue::from_static("198.51.100.9, 203.0.113.7"),
+        );
+        assert_eq!(
+            client_ip(peer, &headers, true),
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(client_ip(peer, &headers, false), peer.ip());
+        headers.insert(
+            "x-forwarded-for",
+            header::HeaderValue::from_static("not-an-address"),
+        );
+        assert_eq!(client_ip(peer, &headers, true), peer.ip());
     }
 
     #[test]

@@ -92,6 +92,8 @@ pub struct Options {
     pub models: &'static [&'static str],
     pub extra_models: Option<&'static str>,
     pub model_tags: Option<&'static str>,
+    pub max_tunnels_per_user: Option<&'static str>,
+    pub max_tunnels: Option<&'static str>,
 }
 
 impl Default for Options {
@@ -102,6 +104,8 @@ impl Default for Options {
             extra_models: None,
             // The hub does not know this internal id, so the operator declares it.
             model_tags: Some("qwen3.8-27b=text"),
+            max_tunnels_per_user: None,
+            max_tunnels: None,
         }
     }
 }
@@ -163,7 +167,7 @@ impl Stack {
 
         let dir = tempfile::tempdir().unwrap();
         let credential_file = dir.path().join("credential");
-        let relay_config = reverse_relay::Config::from_env(&env_of(vec![
+        let mut relay_pairs = vec![
             ("RELAY_TUNNEL_LISTEN", "127.0.0.1:0".into()),
             ("RELAY_API_LISTEN", "127.0.0.1:0".into()),
             ("RELAY_LITELLM_URL", format!("http://{}", litellm.addr)),
@@ -175,8 +179,14 @@ impl Stack {
             ("RELAY_MODELS_POLL_SECS", "1".into()),
             ("RELAY_DEREGISTER_GRACE_SECS", "2".into()),
             ("RELAY_RECONCILE_INTERVAL_SECS", "1".into()),
-        ]))
-        .unwrap();
+        ];
+        if let Some(cap) = options.max_tunnels_per_user {
+            relay_pairs.push(("RELAY_MAX_TUNNELS_PER_USER", cap.to_owned()));
+        }
+        if let Some(cap) = options.max_tunnels {
+            relay_pairs.push(("RELAY_MAX_TUNNELS", cap.to_owned()));
+        }
+        let relay_config = reverse_relay::Config::from_env(&env_of(relay_pairs)).unwrap();
         let relay = reverse_relay::Relay::bind(relay_config).await.unwrap();
         let relay_api = relay.api_addr().unwrap();
         let relay_tunnel = relay.tunnel_addr().unwrap();
@@ -222,6 +232,36 @@ impl Stack {
             relay_task,
             agent_stop,
             agent_task,
+        }
+    }
+
+    /// Connects one more node of the same account, sharing the stack's engine.
+    pub async fn spawn_agent(&self, index: usize) -> SecondAgent {
+        let config = reverse_agent::Config::from_env(&env_of(vec![
+            ("AGENT_RELAY_URL", format!("http://{}", self.relay_tunnel)),
+            ("AGENT_AUTH_ISSUER", format!("http://{}", self.idp.addr)),
+            ("AGENT_AUTH_CLIENT_ID", "reverse-agent".to_owned()),
+            ("AGENT_AUTH_RESOURCE", AUDIENCE.to_owned()),
+            (
+                "AGENT_CREDENTIAL_FILE",
+                self.credential_file
+                    .with_file_name(format!("credential-{index}"))
+                    .display()
+                    .to_string(),
+            ),
+            ("AGENT_UPSTREAM_URL", format!("http://{}", self.engine.addr)),
+            ("AGENT_UPSTREAM_API_KEY", ENGINE_KEY.into()),
+            ("AGENT_MODELS_POLL_SECS", "1".into()),
+            ("AGENT_HF_METADATA", "true".into()),
+            ("AGENT_HF_URL", format!("http://{}", self.hub.addr)),
+        ]))
+        .unwrap();
+        let (stop, stopped) = reverse_core::shutdown::channel();
+        let task = tokio::spawn(reverse_agent::run(config, stopped));
+        SecondAgent {
+            engine: self.engine.shared(),
+            stop,
+            task,
         }
     }
 

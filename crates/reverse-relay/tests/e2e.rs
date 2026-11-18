@@ -370,3 +370,46 @@ async fn a_rejected_engine_key_surfaces_as_a_bad_gateway_not_a_401() {
     );
     stack.shutdown().await;
 }
+
+#[tokio::test]
+async fn repeated_bad_credentials_lock_the_address_out() {
+    let stack = Stack::start(Options::default()).await;
+    let upgrade = |authorization: &str| {
+        format!(
+            "GET /tunnel HTTP/1.1\r\nhost: relay\r\nconnection: upgrade\r\nupgrade: reverse-h2/1\r\nauthorization: {authorization}\r\nx-agent-id: 0123456789abcdef\r\n\r\n"
+        )
+    };
+    for _ in 0..5 {
+        let reply = raw_exchange(stack.relay_tunnel, &upgrade("Bearer nope")).await;
+        assert!(reply.starts_with("HTTP/1.1 401"), "{reply}");
+    }
+    let blocked = raw_exchange(stack.relay_tunnel, &upgrade("Bearer nope")).await;
+    assert!(blocked.starts_with("HTTP/1.1 429"), "{blocked}");
+    assert!(
+        blocked.to_ascii_lowercase().contains("retry-after"),
+        "{blocked}"
+    );
+    stack.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_account_cannot_exceed_its_tunnel_cap() {
+    let stack = Stack::start(Options {
+        max_tunnels_per_user: Some("1"),
+        ..Options::default()
+    })
+    .await;
+    eventually("the first tunnel to register", || async {
+        (stack.litellm.names() == ["tester/qwen3.8-27b"]).then_some(())
+    })
+    .await;
+    let token = stack
+        .idp
+        .token(AUDIENCE, "openid profile offline_access tunnel:serve");
+    let upgrade = format!(
+        "GET /tunnel HTTP/1.1\r\nhost: relay\r\nconnection: upgrade\r\nupgrade: reverse-h2/1\r\nauthorization: Bearer {token}\r\nx-agent-id: 0123456789abcdef\r\n\r\n"
+    );
+    let reply = raw_exchange(stack.relay_tunnel, &upgrade).await;
+    assert!(reply.starts_with("HTTP/1.1 429"), "{reply}");
+    stack.shutdown().await;
+}

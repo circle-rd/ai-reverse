@@ -347,6 +347,9 @@ private helpers.
 - No real relay, engine, network access or Docker is required for the tests of
   this repository. The one live hub lookup is an `#[ignore]`d test in
   `catalog.rs`; run it manually when egress is available.
+- The relay load smoke test opens 500 tunnels
+  (`cargo test -p reverse-relay --test load -- --ignored`); it runs in ~20 s
+  and is kept out of CI for cost, not flakiness.
 
 ### Rules
 
@@ -374,6 +377,10 @@ private helpers.
 - The relay verifies access tokens offline against the provider's JWKS; a
   token must carry the relay URL as audience and the `tunnel:serve` scope. The
   agent id header is validated as 16 lowercase hex characters.
+- Tunnel authentication has a single chokepoint that fails uniformly; failed
+  attempts are counted per client address in bounded state, locked out with a
+  `Retry-After` after a threshold, with lockouts doubling and expiring.
+- Tunnels are capped globally and per account; both answer `429`.
 - Only the routes allowlisted in `reverse_core::forward` cross the tunnel;
   queries are never forwarded; only `content-type`, `content-length`, `accept`
   and `x-request-id` request headers are forwarded.

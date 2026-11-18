@@ -5,6 +5,7 @@ pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod error;
+pub mod limiter;
 pub mod litellm;
 pub mod reconcile;
 pub mod registry;
@@ -24,6 +25,7 @@ pub use error::RelayError;
 
 use crate::api::ApiState;
 use crate::auth::AuthState;
+use crate::limiter::{FailureLimiter, LimiterConfig};
 use crate::litellm::LiteLlm;
 use crate::reconcile::Timing;
 use crate::registry::Registry;
@@ -72,9 +74,16 @@ impl Relay {
         let tunnel_state = Arc::new(TunnelState {
             registry: registry.clone(),
             auth: Arc::new(self.auth),
+            limiter: Arc::new(FailureLimiter::new(LimiterConfig {
+                threshold: config.auth_failure_threshold,
+                window: config.auth_failure_window,
+                lockout: config.auth_lockout,
+            })),
             models_poll: config.models_poll,
             poll_timeout: config.request_timeout.min(config.models_poll * 2),
             limit: Arc::new(Semaphore::new(config.max_tunnels)),
+            max_tunnels_per_user: config.max_tunnels_per_user,
+            trust_forwarded_for: config.trust_forwarded_for,
             shutdown: shutdown.clone(),
         });
         let api_state = Arc::new(ApiState {

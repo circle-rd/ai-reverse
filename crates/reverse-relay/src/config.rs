@@ -53,6 +53,14 @@ pub struct Config {
     pub litellm_timeout: Duration,
     /// Cap on simultaneously upgraded tunnels.
     pub max_tunnels: usize,
+    /// Cap on simultaneously upgraded tunnels for one account.
+    pub max_tunnels_per_user: usize,
+    /// Failed tunnel authentications within the window that lock an address out.
+    pub auth_failure_threshold: u32,
+    /// Window that counts failed tunnel authentications.
+    pub auth_failure_window: Duration,
+    /// Lockout applied when the threshold is reached.
+    pub auth_lockout: Duration,
     /// Whether the last `X-Forwarded-For` entry is the client address (a proxy sits in front).
     pub trust_forwarded_for: bool,
 }
@@ -111,6 +119,16 @@ impl Config {
             max_request_bytes: env.bytes("RELAY_MAX_REQUEST_BYTES", DEFAULT_MAX_REQUEST_BYTES)?,
             litellm_timeout: env.duration_secs("RELAY_LITELLM_TIMEOUT_SECS", 15)?,
             max_tunnels: env.bytes("RELAY_MAX_TUNNELS", 256)?,
+            max_tunnels_per_user: env.bytes("RELAY_MAX_TUNNELS_PER_USER", 64)?,
+            auth_failure_threshold: u32::try_from(env.bytes("RELAY_AUTH_FAILURE_THRESHOLD", 5)?)
+                .map_err(|_| {
+                    ConfigError::invalid(
+                        "RELAY_AUTH_FAILURE_THRESHOLD",
+                        "must fit in a 32-bit counter",
+                    )
+                })?,
+            auth_failure_window: env.duration_secs("RELAY_AUTH_FAILURE_WINDOW_SECS", 60)?,
+            auth_lockout: env.duration_secs("RELAY_AUTH_LOCKOUT_SECS", 60)?,
             trust_forwarded_for: env.flag("RELAY_TRUST_FORWARDED_FOR")?,
         })
     }
@@ -236,6 +254,10 @@ mod tests {
         assert_eq!(cfg.auth_audience, "https://broker.example.com");
         assert_eq!(cfg.auth_scope, "tunnel:serve");
         assert_eq!(cfg.litellm_provider, "hosted_vllm");
+        assert_eq!(cfg.max_tunnels_per_user, 64);
+        assert_eq!(cfg.auth_failure_threshold, 5);
+        assert_eq!(cfg.auth_failure_window, Duration::from_secs(60));
+        assert_eq!(cfg.auth_lockout, Duration::from_secs(60));
     }
 
     #[test]
