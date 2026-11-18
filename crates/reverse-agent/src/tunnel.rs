@@ -11,19 +11,21 @@ use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use reverse_core::ids::AgentId;
 use reverse_core::secret::SecretString;
 use reverse_core::shutdown::triggered;
-use reverse_core::wire::{TUNNEL_PATH, TUNNEL_PROTOCOL};
+use reverse_core::wire::{AGENT_ID_HEADER, TUNNEL_PATH, TUNNEL_PROTOCOL};
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
 
+use crate::auth;
 use crate::config::Config;
 use crate::error::TunnelError;
 use crate::proxy::{AgentState, handle};
-use crate::{credential, enroll, tls};
+use crate::tls;
 
 const STABLE_AFTER: Duration = Duration::from_secs(10);
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -32,8 +34,8 @@ const MAX_CONCURRENT_STREAMS: u32 = 256;
 
 /// Keeps a tunnel open until shutdown, reconnecting with exponential backoff.
 ///
-/// Without a configured token the agent pairs with the relay first, and pairs again whenever
-/// the relay stops accepting its saved credential.
+/// Without a saved credential the agent authorizes itself through the device flow, and runs
+/// through it again whenever the refresh token stops working.
 pub async fn run(config: Arc<Config>, state: Arc<AgentState>, mut shutdown: watch::Receiver<bool>) {
     let tls = if config.relay.scheme() == &http::uri::Scheme::HTTPS {
         match tls::connector() {
@@ -46,45 +48,50 @@ pub async fn run(config: Arc<Config>, state: Arc<AgentState>, mut shutdown: watc
     } else {
         None
     };
-    let mut token = match &config.token {
-        Some(token) => Some(token.clone()),
-        None => credential::load(&config.credential_file).unwrap_or_else(|error| {
-            tracing::warn!(%error, "credential.unreadable");
-            None
-        }),
+    let mut session = match auth::Session::new(&config) {
+        Ok(session) => session,
+        Err(error) => {
+            tracing::error!(%error, "auth.setup_failed");
+            return;
+        }
     };
+    session.load();
 
     let mut delay = config.reconnect_min;
     loop {
-        let current = match token.clone() {
-            Some(current) => current,
-            None => match enroll::acquire(&config, &mut shutdown).await {
-                Some(fresh) => {
-                    token = Some(fresh.clone());
-                    fresh
-                }
-                None => return,
-            },
+        if session.agent_id().is_none() && !session.enroll(&mut shutdown).await {
+            return;
+        }
+        let Some(access) = session.access(&mut shutdown).await else {
+            session.forget();
+            continue;
+        };
+        let Some(agent_id) = session.agent_id() else {
+            continue;
         };
 
         let started = Instant::now();
         let dialed = tokio::select! {
-            result = dial(&config, tls.as_ref(), &current) => result,
+            result = dial(&config, tls.as_ref(), &access, &agent_id) => result,
             () = triggered(&mut shutdown) => return,
         };
         match dialed {
             Ok(upgraded) => {
-                tracing::info!(relay = %config.relay.authority(), "tunnel.connected");
+                tracing::info!(
+                    relay = %config.relay.authority(),
+                    agent_id = %agent_id,
+                    "tunnel.connected"
+                );
                 match serve(upgraded, state.clone(), shutdown.clone()).await {
                     Ok(()) => tracing::info!("tunnel.closed"),
                     Err(error) => tracing::warn!(%error, "tunnel.failed"),
                 }
             }
-            Err(TunnelError::Refused(StatusCode::UNAUTHORIZED)) if config.token.is_none() => {
+            Err(TunnelError::Refused(StatusCode::UNAUTHORIZED)) => {
                 tracing::warn!("credential.rejected");
-                credential::forget(&config.credential_file);
-                token = None;
-                continue;
+                if session.renew(&mut shutdown).await.is_none() {
+                    session.forget();
+                }
             }
             Err(error) => tracing::warn!(%error, "tunnel.dial_failed"),
         }
@@ -116,7 +123,8 @@ async fn bounded<T, E>(
 async fn dial(
     config: &Config,
     tls: Option<&TlsConnector>,
-    token: &SecretString,
+    access: &SecretString,
+    agent_id: &AgentId,
 ) -> Result<Upgraded, TunnelError> {
     let limit = config.connect_timeout;
     let stream = bounded(
@@ -128,12 +136,12 @@ async fn dial(
     stream.set_nodelay(true).map_err(TunnelError::Connect)?;
 
     match tls {
-        None => upgrade(stream, config, token).await,
+        None => upgrade(stream, config, access, agent_id).await,
         Some(connector) => {
             let name = ServerName::try_from(config.relay.host().to_owned())
                 .map_err(|_| TunnelError::ServerName)?;
             let secured = bounded(limit, connector.connect(name, stream), TunnelError::Tls).await?;
-            upgrade(secured, config, token).await
+            upgrade(secured, config, access, agent_id).await
         }
     }
 }
@@ -141,7 +149,8 @@ async fn dial(
 async fn upgrade<S>(
     stream: S,
     config: &Config,
-    token: &SecretString,
+    access: &SecretString,
+    agent_id: &AgentId,
 ) -> Result<Upgraded, TunnelError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -164,8 +173,9 @@ where
         .header(header::UPGRADE, TUNNEL_PROTOCOL)
         .header(
             header::AUTHORIZATION,
-            token.bearer_header().map_err(TunnelError::Credential)?,
+            access.bearer_header().map_err(TunnelError::Credential)?,
         )
+        .header(AGENT_ID_HEADER, agent_id.as_str())
         .body(Empty::<Bytes>::new())?;
     let response = bounded(limit, sender.send_request(request), TunnelError::Handshake).await?;
 

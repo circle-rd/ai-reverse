@@ -1,10 +1,10 @@
 //! Reverse tunnel agent: exposes a local OpenAI-compatible engine to a relay without any inbound port.
 
+pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod credential;
 pub mod discovery;
-pub mod enroll;
 pub mod error;
 pub mod hardware;
 pub mod proxy;
@@ -43,7 +43,7 @@ pub async fn run(config: Config, shutdown: watch::Receiver<bool>) {
             Ok(catalog) => {
                 tracing::info!(
                     hub = %config.hf_url.origin(),
-                    "catalog.enabled; model ids are sent to the hub, AGENT_HF_METADATA=off keeps them local"
+                    "catalog.enabled; model ids are sent to the hub, AGENT_HF_METADATA=false keeps them local"
                 );
                 Some(Arc::new(catalog))
             }

@@ -56,7 +56,8 @@ baseline; when a material conflict remains, stop and ask before mutation.
 | Command | Purpose |
 | --- | --- |
 | `cargo build --locked` | Debug build; zero warnings allowed |
-| `cargo build --release --locked -p reverse-agent` | Release build used by the image |
+| `cargo build --release --locked -p reverse-agent` | Release build used by the agent image |
+| `cargo build --release --locked -p reverse-relay` | Release build used by the relay image |
 | `cargo check --workspace --all-targets --all-features --locked` | Fast type-check of lib, bins, tests |
 | `cargo fmt --all` | Write rustfmt formatting |
 | `cargo fmt --all --check` | Verify formatting (CI gate) |
@@ -64,7 +65,7 @@ baseline; when a material conflict remains, stop and ask before mutation.
 | `cargo test --workspace --all-targets --all-features --locked` | Unit and integration suite (CI gate) |
 | `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked` | Documentation gate |
 | `cargo audit` | Dependency advisories (CI gate) |
-| `docker build -t reverse-agent .` | Container build (CI gate) |
+| `docker build -t reverse-agent -f Dockerfile .` and `docker build -t reverse-relay -f Dockerfile.relay .` | Container builds (CI gate) |
 
 A change is mergeable only when formatting, Clippy, all tests, documentation,
 `cargo audit`, and the Docker build pass — the exact steps
@@ -84,9 +85,12 @@ change.
 OpenAI-compatible inference engine to a remote relay without accepting any
 inbound connection. It dials the relay, upgrades an HTTP/1.1 connection to the
 `reverse-h2/1` protocol, serves HTTP/2 on the upgraded stream, and proxies the
-allowlisted OpenAI routes to the engine. The relay side terminates the tunnels,
-serves the OpenAI-compatible surface to LiteLLM, registers the announced models
-and meters usage; that side is **not part of this repository** (exception E1).
+allowlisted OpenAI routes to the engine. `reverse-relay` (binary of
+`crates/reverse-relay`) is the other half, versioned here: it terminates the
+tunnels, serves the OpenAI-compatible surface to LiteLLM and keeps LiteLLM's
+model list in sync. Both crates share the wire contract in `reverse-core`; the
+identity provider (CIRCLE auth-service) and LiteLLM itself are external
+services (exception E1).
 
 | Layer | Technology |
 | --- | --- |
@@ -119,7 +123,7 @@ must be written in English.** No exceptions.
 | Constants | `SCREAMING_SNAKE_CASE` | `DEFAULT_CREDENTIAL_FILE` |
 | Cargo crate / binary | `kebab-case` | `reverse-agent` |
 | Wire models | Rust `snake_case`, serde rename | `#[serde(rename_all = "camelCase")]` |
-| Log event names | lower dot path | `tunnel.connected`, `models.changed`, `enroll.approved` |
+| Log event names | lower dot path | `tunnel.connected`, `models.changed`, `auth.enrolled` |
 
 ### Comments
 
@@ -182,8 +186,8 @@ must be written in English.** No exceptions.
 ### Secrets and cryptography
 
 - Secret material uses `SecretString`; never `Debug`-print it.
-- The pairing credential is written atomically (temp file + rename) with mode
-  0600 and deleted when the relay rejects it.
+- The refresh token and agent id are written atomically (temp file + rename)
+  with mode 0600 and deleted when the identity provider stops accepting them.
 - Never log tokens, device codes, user codes, engine keys or raw peer bodies.
 - The engine key is injected into upstream requests by `upstream.rs` only; the
   caller's `Authorization` and `Cookie` headers are never forwarded.
@@ -199,13 +203,16 @@ must be written in English.** No exceptions.
   before entering the snapshot; rejected ids are logged and dropped.
 - Announced models are the union of the engine's `/v1/models` and
   `AGENT_EXTRA_MODELS`, deduplicated and sorted.
+- Model aliases are per account (`{preferred_username}/{model}`); agents of the
+  same account that announce the same id share one deployment and are pooled by
+  the relay, while distinct ids remain distinct aliases.
 - Capability tags resolve in one order: `AGENT_MODEL_TAGS` (operator), then the
   hub's `pipeline_tag` mapped in `catalog.rs`, then no tag. Never infer tags
   from the model name: names are not a stable classification and new families
   would silently misclassify.
 - Hub lookups are enrichment: bounded by `AGENT_HF_TIMEOUT_SECS`, cached, with a
   negative cache, one bounded pass per discovery cycle so a slow hub cannot
-  postpone the announcement of newly discovered models, `AGENT_HF_METADATA=off`
+  postpone the announcement of newly discovered models, `AGENT_HF_METADATA=false`
   for air-gapped boxes, and no effect on serving when they fail.
 - Client ids and reserved prefixes are validated by `reverse_core::ids`; the
   reserved list exists because LiteLLM parses `provider/model` prefixes.
@@ -219,7 +226,7 @@ must be written in English.** No exceptions.
 - Avoid cloning large structures in hot paths; `Arc` shared state, clone only
   short identifiers.
 - No `dbg!`, `println!`, `eprintln!` except the two sanctioned entrypoint
-  paths: startup errors and the pairing code (exception E2).
+  paths: startup errors and the device-flow verification code (exception E2).
 
 ---
 
@@ -258,8 +265,8 @@ crates/
 └── reverse-agent/               # the binary
     ├── src/main.rs              # entrypoint: config, logging, signals
     ├── src/config.rs            # typed AGENT_* configuration
-    ├── src/enroll.rs            # pairing: /enroll/start, /enroll/poll, approval
-    ├── src/credential.rs        # 0600 atomic credential file
+    ├── src/auth.rs              # device flow, refresh rotation, access tokens
+    ├── src/credential.rs        # 0600 atomic refresh-token and agent-id file
     ├── src/tunnel.rs            # dial, upgrade, HTTP/2 serve, reconnect backoff
     ├── src/discovery.rs         # engine /v1/models polling, extras, validated snapshots
     ├── src/catalog.rs           # model tags from the Hugging Face pipeline_tag (cached)
@@ -268,6 +275,19 @@ crates/
     ├── src/hardware.rs          # self-reported host facts from /proc and /sys
     ├── src/tls.rs               # rustls connector for https relays
     └── src/error.rs             # UpstreamError, DiscoveryError, TunnelError
+└── reverse-relay/               # the relay binary
+    ├── src/main.rs              # entrypoint: config, logging, signals
+    ├── src/lib.rs               # listeners, state wiring, serve loop
+    ├── src/config.rs            # typed RELAY_* configuration
+    ├── src/tunnel_server.rs     # tunnel upgrade and per-agent model polling
+    ├── src/api.rs               # OpenAI surface served to LiteLLM
+    ├── src/litellm.rs           # LiteLLM admin client (deployments)
+    ├── src/reconcile.rs         # desired vs actual deployments
+    ├── src/registry.rs          # live agents and their announced models
+    ├── src/watcher.rs           # announced snapshot reader
+    ├── src/auth.rs              # JWKS token verification (aud, scope, agent id)
+    └── tests/                   # harness: real agent, fake engine, fake LiteLLM,
+                                 #          fake identity provider
 ```
 
 ### Separation of concerns
@@ -279,11 +299,15 @@ crates/
 | `reverse-core/config.rs` | Environment parsing primitives | agent or relay policy |
 | `reverse-core/forward.rs` | Tunnel allowlist: routes, headers, error shapes | engine specifics |
 | `reverse-agent/config.rs` | `AGENT_*` validation, typed `Config` | protocol logic |
-| `reverse-agent/enroll.rs` | Pairing flow and credential acquisition | request proxying |
+| `reverse-agent/auth.rs` | Device flow, token refresh, credential acquisition | request proxying |
 | `reverse-agent/tunnel.rs` | Connection lifecycle and backoff | route policy |
 | `reverse-agent/proxy.rs` | Serving the allowlisted routes | engine authentication |
 | `reverse-agent/upstream.rs` | Engine client and key injection | model routing |
 | `reverse-agent/catalog.rs` | Hub metadata lookup and tag mapping | engine or relay policy |
+| `reverse-relay/config.rs` | `RELAY_*` validation, typed `Config` | agent or auth-service policy |
+| `reverse-relay/tunnel_server.rs` | Tunnel upgrade and per-agent model polling | LiteLLM policy |
+| `reverse-relay/litellm.rs` | LiteLLM admin client | request proxying |
+| `reverse-relay/reconcile.rs` | Desired vs actual deployments | route policy |
 | `main.rs` | Startup and shutdown | domain logic |
 
 ### File size limits
@@ -298,8 +322,8 @@ crates/
   `reverse-core`; the agent never redefines them.
 - Configuration validation is centralized in the typed `Config` builders; no
   per-module env reads.
-- The relay crate (`validation/reverse-relay`, unversioned) consumes
-  `reverse-core` through a path dependency so the contract stays single-source.
+- `crates/reverse-relay` consumes `reverse-core` through a workspace path
+  dependency so the contract stays single-source.
 
 ---
 
@@ -317,19 +341,25 @@ private helpers.
 - The agent's tests cover configuration validation, credential file semantics,
   model-id validation, model-tag resolution (against a fake hub), snapshot
   publication, hardware detection and the TLS connector.
+- The relay's tests cover configuration validation, tunnel token verification
+  (audience, scope, agent id), snapshot polling, the LiteLLM reconciliation
+  diff and the proxy surface, plus an end-to-end harness (real agent, fake
+  engine, fake LiteLLM, fake identity provider).
 - No real relay, engine, network access or Docker is required for the tests of
   this repository. The one live hub lookup is an `#[ignore]`d test in
   `catalog.rs`; run it manually when egress is available.
+- The relay load smoke test opens 500 tunnels
+  (`cargo test -p reverse-relay --test load -- --ignored`); it runs in ~20 s
+  and is kept out of CI for cost, not flakiness.
 
 ### Rules
 
 - All waits have bounded timeouts; no fixed sleeps as synchronization.
 - Test fixtures use synthetic tokens and keys; never real credentials.
 - Do not weaken assertions to make flaky tests pass; fix the race.
-- The relay-side integration suite (real agent + real relay + fake engine +
-  fake LiteLLM) and the live LiteLLM PoC recipes live in the ignored
-  `validation/` directory (exception E1); run them locally after any wire or
-  allowlist change.
+- The live PoC and dev stacks (real agent + real relay + real LiteLLM,
+  Postgres and Docker) live in the ignored `validation/` directory
+  (exception E1); run them locally after any wire or allowlist change.
 
 ---
 
@@ -340,10 +370,18 @@ private helpers.
   explicitly allows plain HTTP to a non-loopback host; loopback plaintext is
   allowed for local development.
 - The engine origin must be plain `http`; TLS to the local engine is rejected.
-- Pairing requires a human approval in a browser; the verification URL and user
-  code are shown on stderr and at `info` level. The saved credential is a
-  bearer secret: file mode 0600, atomic write, and deleted on relay rejection
-  (`401`).
+- Agent authorization uses the device flow of the identity provider: a human
+  approval in a browser; the verification URL and user code are shown on stderr
+  and at `info` level. The refresh token and agent id are secrets: file mode
+  0600, atomic write, rotated on refresh, and deleted when the provider rejects
+  them.
+- The relay verifies access tokens offline against the provider's JWKS; a
+  token must carry the relay URL as audience and the `tunnel:serve` scope. The
+  agent id header is validated as 16 lowercase hex characters.
+- Tunnel authentication has a single chokepoint that fails uniformly; failed
+  attempts are counted per client address in bounded state, locked out with a
+  `Retry-After` after a threshold, with lockouts doubling and expiring.
+- Tunnels are capped globally and per account; both answer `429`.
 - Only the routes allowlisted in `reverse_core::forward` cross the tunnel;
   queries are never forwarded; only `content-type`, `content-length`, `accept`
   and `x-request-id` request headers are forwarded.
@@ -355,7 +393,7 @@ private helpers.
   idle-stall guards apply in both directions.
 - Host facts are self-reported from `/proc` and `/sys` and are treated as
   untrusted text by the consumer.
-- Model metadata is fetched from the hub only when `AGENT_HF_METADATA` is `on`;
+- Model metadata is fetched from the hub only when `AGENT_HF_METADATA` is `true`;
   the request carries the model id and, when set, `AGENT_HF_TOKEN`. Nothing else
   about the box leaves it. Turning the lookup off keeps ids on the box.
 - Runtime image: `scratch`, non-root (UID/GID 65532), read-only root filesystem,
@@ -390,8 +428,9 @@ private helpers.
   (including reserved client ids) live in `crates/reverse-core/src/ids.rs`.
   Update them, their tests and the README in the same change.
 - User-visible behavior changes need tests and documentation in the same change.
-- Release tags are `v*`; the image publishes `nightly` from manual dispatch and
-  semver plus `latest` from tags, for `linux/amd64` and `linux/arm64`.
+- Release tags are `v*`; both images (agent and relay) publish `nightly` from
+  manual dispatch and semver plus `latest` from tags, for `linux/amd64` and
+  `linux/arm64`.
 - Keep `AGENTS.md` truthful. If a rule is intentionally violated, document the
   exception in the same change.
 
@@ -410,39 +449,34 @@ Any exception must state, in the change itself:
 
 Undocumented exceptions are defects.
 
-### E1 — The relay and the validation stacks are not versioned
+### E1 — The live validation stacks are not versioned
 
 1. **Rule relaxed:** the whole system is versioned and gated in CI (manifesto
    rule 07); no dead or hidden code.
-2. **Why:** `reverse-relay` is the platform-side broker (OIDC sign-in, LiteLLM
-   model management, usage metering, operator endpoints) and may move to another
-   project; publishing it now is premature. The PoC and dev stacks need a real
-   LiteLLM, Postgres and Docker, so they cannot be deterministic CI gates.
-3. **Risk/impact:** relay behavior and compatibility with a real LiteLLM are
-   not gated by this repository's CI; a relay-side contract change could break
-   deployed agents silently.
-4. **Mitigation:** the relay crate is kept buildable at
-   `validation/reverse-relay` with a standalone manifest and path dependencies on
-   the versioned crates; its full integration suite (real agent, real relay,
-   fake engine, fake LiteLLM) runs locally with `cargo test` in that directory;
-   the wire contract and identifier validation live in versioned
-   `reverse-core`, so agent-side guarantees stay gated.
-5. **Rejected alternative:** publishing the relay and the PoC in this repository
-   would expose platform internals (OIDC and dashboard design, deployment
-   topology) before they are ready to be public.
-6. **Revisit:** when the relay gets its own repository or is intentionally
-   published; review this exception at every release until then.
+2. **Why:** the PoC and dev stacks need a real LiteLLM, Postgres and Docker, so
+   they cannot be deterministic CI gates; they stay local.
+3. **Risk/impact:** the live-stack recipes are not gated and can drift from the
+   versioned crates; a wire or configuration change could break them silently.
+4. **Mitigation:** both binaries are versioned crates with their own
+   deterministic harness (real agent, fake engine, fake LiteLLM, fake hub); the
+   local stacks consume the versioned crates through path dependencies; run
+   them locally after any wire or allowlist change.
+5. **Rejected alternative:** making a real LiteLLM and Postgres a mandatory CI
+   dependency.
+6. **Revisit:** when the stacks can run deterministically in CI.
 
-### E2 — The agent prints the pairing URL and user code to stderr
+### E2 — The agent prints the device-flow URL and user code to stderr
 
 1. **Rule relaxed:** no `println!`/`eprintln!` outside entrypoint startup
    errors.
-2. **Why:** first-run pairing requires the verification URL and user code on
-   the operator's terminal; a `scratch` container has no browser channel.
+2. **Why:** the first run needs human approval, so the verification URL and
+   user code must reach the operator's terminal; a `scratch` container has no
+   browser channel.
 3. **Risk/impact:** stderr may be captured by log shippers.
-4. **Mitigation:** the output carries no secret material — only the relay URL
-   and a short-lived user code that is also logged at `info` level as
-   `enroll.waiting_for_approval`.
-5. **Rejected alternative:** forcing operators to read JSON logs to pair an
-   agent.
-6. **Revisit:** if the relay gains an out-of-band channel for pairing codes.
+4. **Mitigation:** the output carries no secret material — only the identity
+   provider's verification URL and a short-lived user code that is also logged
+   at `info` level as `auth.waiting_for_approval`.
+5. **Rejected alternative:** forcing operators to read JSON logs to authorize
+   an agent.
+6. **Revisit:** if the identity provider gains an out-of-band channel for
+   device codes.

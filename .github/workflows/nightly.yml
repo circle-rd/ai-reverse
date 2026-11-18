@@ -1,4 +1,4 @@
-name: Nightly — Docker image (nightly)
+name: Nightly — Docker images (nightly)
 
 on:
   workflow_dispatch:
@@ -11,16 +11,25 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}-agent
-  PACKAGE_NAME: ${{ github.event.repository.name }}-agent
 
 jobs:
   build-and-push:
-    name: Build & push nightly Docker image
+    name: Build & push nightly (${{ matrix.name }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: agent
+            dockerfile: Dockerfile
+          - name: relay
+            dockerfile: Dockerfile.relay
+    env:
+      IMAGE_NAME: ${{ github.repository }}-${{ matrix.name }}
+      PACKAGE_NAME: ${{ github.event.repository.name }}-${{ matrix.name }}
 
     steps:
       - name: Checkout repository
@@ -58,6 +67,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly
@@ -65,8 +75,8 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ steps.sha.outputs.full }}
           provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
       - name: Delete superseded nightly version
         if: steps.previous.outputs.id != ''

@@ -310,6 +310,14 @@ mod tests {
                 "AGENT_UPSTREAM_URL".to_owned(),
                 "http://127.0.0.1:30001".to_owned(),
             ),
+            (
+                "AGENT_AUTH_ISSUER".to_owned(),
+                "http://127.0.0.1:9000".to_owned(),
+            ),
+            (
+                "AGENT_AUTH_CLIENT_ID".to_owned(),
+                "reverse-agent".to_owned(),
+            ),
             ("AGENT_HF_URL".to_owned(), "http://127.0.0.1:1".to_owned()),
         ]);
         let config = crate::config::Config::from_env(&reverse_core::config::Env::new(move |key| {
