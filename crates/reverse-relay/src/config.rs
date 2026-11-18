@@ -20,7 +20,9 @@ pub struct Config {
     /// LiteLLM admin API, always with a trailing slash.
     pub litellm_url: Url,
     /// LiteLLM credential used to register models.
-    pub litellm_master_key: SecretString,
+    pub litellm_management_key: SecretString,
+    /// Whether the management credential is the LiteLLM master key (fallback).
+    pub litellm_management_uses_master: bool,
     /// Origin of the tunnel listener as agents and the identity provider see it, without slash.
     pub public_url: String,
     /// Base LiteLLM uses to reach `api_listen`, without trailing slash; may carry a path prefix.
@@ -98,11 +100,17 @@ impl Config {
             ));
         }
 
+        let management_key = match env.secret("RELAY_LITELLM_API_KEY")? {
+            Some(key) => (key, false),
+            None => (env.required_secret("RELAY_LITELLM_MASTER_KEY")?, true),
+        };
+
         Ok(Self {
             tunnel_listen: socket_addr(env, "RELAY_TUNNEL_LISTEN")?,
             api_listen: socket_addr(env, "RELAY_API_LISTEN")?,
             litellm_url,
-            litellm_master_key: env.required_secret("RELAY_LITELLM_MASTER_KEY")?,
+            litellm_management_key: management_key.0,
+            litellm_management_uses_master: management_key.1,
             api_key: env.required_secret("RELAY_API_KEY")?,
             public_url,
             public_api_base,
@@ -253,11 +261,25 @@ mod tests {
         assert_eq!(cfg.public_url, "https://broker.example.com");
         assert_eq!(cfg.auth_audience, "https://broker.example.com");
         assert_eq!(cfg.auth_scope, "tunnel:serve");
+        assert!(cfg.litellm_management_uses_master);
         assert_eq!(cfg.litellm_provider, "hosted_vllm");
         assert_eq!(cfg.max_tunnels_per_user, 64);
         assert_eq!(cfg.auth_failure_threshold, 5);
         assert_eq!(cfg.auth_failure_window, Duration::from_secs(60));
         assert_eq!(cfg.auth_lockout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_dedicated_management_key_replaces_the_master_key() {
+        let pairs: Vec<_> = BASE
+            .iter()
+            .filter(|(k, _)| *k != "RELAY_LITELLM_MASTER_KEY")
+            .copied()
+            .chain([("RELAY_LITELLM_API_KEY", "sk-management")])
+            .collect();
+        let cfg = load(&pairs).unwrap();
+        assert!(!cfg.litellm_management_uses_master);
+        assert_eq!(cfg.litellm_management_key.expose(), "sk-management");
     }
 
     #[test]

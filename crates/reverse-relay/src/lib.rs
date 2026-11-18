@@ -99,6 +99,9 @@ impl Relay {
             grace: config.deregister_grace,
         };
 
+        if config.litellm_management_uses_master {
+            tracing::warn!("relay.litellm_master_key_fallback");
+        }
         tracing::info!(
             tunnel = ?self.tunnel_listener.local_addr().ok(),
             api = ?self.api_listener.local_addr().ok(),

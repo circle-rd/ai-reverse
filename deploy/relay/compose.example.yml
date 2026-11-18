@@ -1,0 +1,29 @@
+# reverse-relay behind Traefik. Agents dial https://relay.example.com; LiteLLM
+# reaches the OpenAI surface on the internal network only.
+# Copy .env.example to .env and adjust. Secrets may be mounted instead.
+services:
+  reverse-relay:
+    image: ghcr.io/circle-rd/ai-reverse-relay:latest
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    env_file:
+      - .env
+    expose:
+      - "8080"
+      - "8081"
+    networks:
+      - relay-net
+    labels:
+      - traefik.enable=true
+      # Only the tunnel listener is published. Never route 8081 through Traefik:
+      # the OpenAI surface is LiteLLM's private upstream.
+      - traefik.http.routers.relay.rule=Host(`relay.example.com`)
+      - traefik.http.routers.relay.entrypoints=websecure
+      - traefik.http.routers.relay.tls.certresolver=letsencrypt
+      - traefik.http.services.relay.loadbalancer.server.port=8080
+
+networks:
+  relay-net:
+    external: true

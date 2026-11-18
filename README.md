@@ -114,6 +114,24 @@ docker run --rm --network host --read-only --cap-drop ALL \
 If you uncomment the file form of the engine key, bind-mount it for the plain
 `docker run` too (`-v $PWD/secrets/upstream_api_key:/run/secrets/upstream_api_key:ro`).
 
+### Relay
+
+The relay terminates agent tunnels and registers the announced models in
+LiteLLM. It publishes **only** the tunnel listener; the OpenAI surface stays on
+the private network for LiteLLM to call.
+
+```bash
+cp deploy/relay/.env.example deploy/relay/.env   # then edit it
+cd deploy/relay
+docker compose -f compose.example.yml pull
+docker compose -f compose.example.yml up -d
+```
+
+The compose example expects a Traefik network and routes
+`relay.example.com` to the tunnel listener. Do not route the API listener
+(`RELAY_API_LISTEN`) through the proxy. Behind Traefik, keep
+`RELAY_TRUST_FORWARDED_FOR=true`.
+
 ## Configuration
 
 Required settings have no silent defaults. Supplying both `KEY` and
@@ -151,6 +169,42 @@ set. Secrets are never echoed in errors or logs.
 
 Plain-text transport to a non-loopback relay is refused unless
 `AGENT_INSECURE_TRANSPORT=true` is set explicitly.
+
+### Relay settings
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `RELAY_TUNNEL_LISTEN` | yes | `ip:port` where agents dial the tunnel. |
+| `RELAY_API_LISTEN` | yes | `ip:port` of the OpenAI surface LiteLLM calls; never publish it. |
+| `RELAY_PUBLIC_URL` | yes | Public tunnel origin as agents and the identity provider see it. |
+| `RELAY_PUBLIC_API_BASE` | yes | Base URL LiteLLM uses to reach `RELAY_API_LISTEN`, may carry a path prefix. |
+| `RELAY_API_KEY` | yes* | Bearer key LiteLLM presents; injected into registered deployments. |
+| `RELAY_AUTH_ISSUER` | yes | AuthService origin issuing agent tokens. |
+| `RELAY_AUTH_AUDIENCE` | no | Required token audience. Default: `RELAY_PUBLIC_URL`. |
+| `RELAY_AUTH_SCOPE` | no | Required token scope. Default `tunnel:serve`. |
+| `RELAY_LITELLM_URL` | yes | LiteLLM admin API origin. |
+| `RELAY_LITELLM_API_KEY` | no* | Dedicated management key (recommended). |
+| `RELAY_LITELLM_MASTER_KEY` | no* | Fallback management key; logs `relay.litellm_master_key_fallback`. |
+| `RELAY_LITELLM_PROVIDER` | no | Provider prefix of deployments. Default `hosted_vllm`. |
+| `RELAY_MODELS_POLL_SECS` | no | Agent model-list poll interval. Default 5. |
+| `RELAY_DEREGISTER_GRACE_SECS` | no | How long a vanished model stays registered. Default 30. |
+| `RELAY_RECONCILE_INTERVAL_SECS` | no | Desired-vs-actual reconcile period. Default 2. |
+| `RELAY_RESYNC_INTERVAL_SECS` | no | Full LiteLLM resync period. Default 60. |
+| `RELAY_REQUEST_HEADERS_TIMEOUT_SECS` | no | Agent answer deadline. Default 900. |
+| `RELAY_IDLE_TIMEOUT_SECS` | no | Body stall limit, both directions. Default 600. |
+| `RELAY_MAX_REQUEST_BYTES` | no | Largest request body accepted. Default 67108864. |
+| `RELAY_LITELLM_TIMEOUT_SECS` | no | Bound on one LiteLLM admin call. Default 15. |
+| `RELAY_MAX_TUNNELS` | no | Global cap on upgraded tunnels. Default 256. |
+| `RELAY_MAX_TUNNELS_PER_USER` | no | Per-account tunnel cap. Default 64. |
+| `RELAY_AUTH_FAILURE_THRESHOLD` | no | Failed auth attempts before lockout. Default 5. |
+| `RELAY_AUTH_FAILURE_WINDOW_SECS` | no | Window counting failures. Default 60. |
+| `RELAY_AUTH_LOCKOUT_SECS` | no | Initial lockout; doubles up to 8x. Default 60. |
+| `RELAY_TRUST_FORWARDED_FOR` | no | `true`/`false`: trust the last `X-Forwarded-For` entry. Default `false`. |
+
+`*` Exactly one of the direct and `_FILE` forms is required per secret. Supply
+`RELAY_LITELLM_API_KEY` in production; the master key falls back only for
+bootstrap and logs a warning. Both credentials can manage only deployments
+tagged `model_info.managed_by = "reverse-relay"`.
 
 ## Model announcement and tags
 
@@ -195,16 +249,16 @@ never contacts the hub, so model ids stay on the box.
 
 ## Container images
 
-The release workflow publishes `ghcr.io/circle-rd/ai-reverse-agent` for
-`linux/amd64` and `linux/arm64`:
+The workflows publish `ghcr.io/circle-rd/ai-reverse-agent` (`Dockerfile`) and
+`ghcr.io/circle-rd/ai-reverse-relay` (`Dockerfile.relay`) for `linux/amd64` and
+`linux/arm64`:
 
 | Tag | Source |
 | --- | --- |
-| `nightly` | Manual dispatch (`nightly.yml`), builds from `develop` by default; superseded nightly versions are deleted. |
-| `latest`, `X.Y`, `X.Y.Z` | Git tags `v*` (`release.yml`). |
+| `nightly` | Manual dispatch (`nightly.yml`), builds both images from `develop` by default; superseded nightly versions are deleted. |
+| `latest`, `X.Y`, `X.Y.Z` | Git tags `v*` (`release.yml`), both images. |
 
-Pin the image by digest in production. The relay image (`reverse-relay`) is not
-built from this repository; see [AGENTS.md](AGENTS.md) section 10.
+Pin the image by digest in production.
 
 ## Run with Cargo
 
@@ -222,7 +276,8 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 cargo audit
-docker build -t reverse-agent .
+docker build -t reverse-agent -f Dockerfile .
+docker build -t reverse-relay -f Dockerfile.relay .
 ```
 
 `Cargo.lock` is committed and every build uses `--locked`. The toolchain is
@@ -237,6 +292,7 @@ crates/
 ├── reverse-agent/   # binary: device flow, tunnel, discovery, proxy, engine client
 └── reverse-relay/   # binary: tunnel termination, token verification, model registrar
 deploy/agent/        # pull-based compose example + .env.example
+deploy/relay/        # Traefik-ready compose example + .env.example
 ```
 
 The LiteLLM PoC recipes and the local development stacks live in the ignored

@@ -56,7 +56,8 @@ baseline; when a material conflict remains, stop and ask before mutation.
 | Command | Purpose |
 | --- | --- |
 | `cargo build --locked` | Debug build; zero warnings allowed |
-| `cargo build --release --locked -p reverse-agent` | Release build used by the image |
+| `cargo build --release --locked -p reverse-agent` | Release build used by the agent image |
+| `cargo build --release --locked -p reverse-relay` | Release build used by the relay image |
 | `cargo check --workspace --all-targets --all-features --locked` | Fast type-check of lib, bins, tests |
 | `cargo fmt --all` | Write rustfmt formatting |
 | `cargo fmt --all --check` | Verify formatting (CI gate) |
@@ -64,7 +65,7 @@ baseline; when a material conflict remains, stop and ask before mutation.
 | `cargo test --workspace --all-targets --all-features --locked` | Unit and integration suite (CI gate) |
 | `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked` | Documentation gate |
 | `cargo audit` | Dependency advisories (CI gate) |
-| `docker build -t reverse-agent .` | Container build (CI gate) |
+| `docker build -t reverse-agent -f Dockerfile .` and `docker build -t reverse-relay -f Dockerfile.relay .` | Container builds (CI gate) |
 
 A change is mergeable only when formatting, Clippy, all tests, documentation,
 `cargo audit`, and the Docker build pass — the exact steps
@@ -427,8 +428,9 @@ private helpers.
   (including reserved client ids) live in `crates/reverse-core/src/ids.rs`.
   Update them, their tests and the README in the same change.
 - User-visible behavior changes need tests and documentation in the same change.
-- Release tags are `v*`; the image publishes `nightly` from manual dispatch and
-  semver plus `latest` from tags, for `linux/amd64` and `linux/arm64`.
+- Release tags are `v*`; both images (agent and relay) publish `nightly` from
+  manual dispatch and semver plus `latest` from tags, for `linux/amd64` and
+  `linux/arm64`.
 - Keep `AGENTS.md` truthful. If a rule is intentionally violated, document the
   exception in the same change.
 

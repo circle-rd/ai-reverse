@@ -95,7 +95,7 @@ impl LiteLlm {
         Ok(Self {
             http,
             base: config.litellm_url.clone(),
-            key: config.litellm_master_key.clone(),
+            key: config.litellm_management_key.clone(),
             api_key: config.api_key.clone(),
             provider: config.litellm_provider.clone(),
             public_api_base: config.public_api_base.clone(),
