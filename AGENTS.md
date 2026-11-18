@@ -202,6 +202,9 @@ must be written in English.** No exceptions.
   before entering the snapshot; rejected ids are logged and dropped.
 - Announced models are the union of the engine's `/v1/models` and
   `AGENT_EXTRA_MODELS`, deduplicated and sorted.
+- Model aliases are per account (`{preferred_username}/{model}`); agents of the
+  same account that announce the same id share one deployment and are pooled by
+  the relay, while distinct ids remain distinct aliases.
 - Capability tags resolve in one order: `AGENT_MODEL_TAGS` (operator), then the
   hub's `pipeline_tag` mapped in `catalog.rs`, then no tag. Never infer tags
   from the model name: names are not a stable classification and new families

@@ -74,6 +74,7 @@ struct DeleteModel<'a> {
 }
 
 /// Registers and removes deployments in LiteLLM.
+#[derive(Clone)]
 pub struct LiteLlm {
     http: Client,
     base: Url,

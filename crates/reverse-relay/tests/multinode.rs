@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::{Options, Stack, eventually, send, send_streaming};
 use http::{Method, StatusCode};
 
@@ -78,5 +80,47 @@ async fn losing_one_node_keeps_the_models_of_the_others() {
     .await;
     let reply = send(stack.relay_api, Method::POST, CHAT, &body("alpha", false)).await;
     assert_eq!(reply.status, StatusCode::OK);
+    stack.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pooled_model_survives_partial_loss_and_a_reconnect_adds_no_duplicate() {
+    let mut stack = Stack::start(Options::default()).await;
+    let second = stack.start_second_agent(&["qwen3.8-27b"]).await;
+    eventually("the shared alias registered once", || async {
+        (stack.litellm.names() == ["tester/qwen3.8-27b"]).then_some(())
+    })
+    .await;
+
+    second.stop().await;
+    // The grace period covers a reconnect, and the surviving node keeps the alias wanted.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        stack.litellm.names(),
+        ["tester/qwen3.8-27b"],
+        "the model must stay registered while a node still serves it"
+    );
+    let reply = send(
+        stack.relay_api,
+        Method::POST,
+        CHAT,
+        &body("qwen3.8-27b", false),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+
+    stack.restart_agent().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        stack.litellm.names(),
+        ["tester/qwen3.8-27b"],
+        "a reconnect with the same agent id must not register the alias twice"
+    );
+
+    stack.stop_agent().await;
+    eventually("the alias to be removed once no node serves it", || async {
+        stack.litellm.names().is_empty().then_some(())
+    })
+    .await;
     stack.shutdown().await;
 }

@@ -118,6 +118,7 @@ pub struct Stack {
     pub relay_api: SocketAddr,
     pub relay_tunnel: SocketAddr,
     pub credential_file: std::path::PathBuf,
+    agent_pairs: Vec<(&'static str, String)>,
     _dir: tempfile::TempDir,
     relay_stop: watch::Sender<bool>,
     relay_task: JoinHandle<()>,
@@ -203,7 +204,7 @@ impl Stack {
         if let Some(tags) = options.model_tags {
             agent_pairs.push(("AGENT_MODEL_TAGS", tags.to_owned()));
         }
-        let agent_config = reverse_agent::Config::from_env(&env_of(agent_pairs)).unwrap();
+        let agent_config = reverse_agent::Config::from_env(&env_of(agent_pairs.clone())).unwrap();
         let (agent_stop, agent_stopped) = reverse_core::shutdown::channel();
         let agent_task = tokio::spawn(reverse_agent::run(agent_config, agent_stopped));
 
@@ -215,6 +216,7 @@ impl Stack {
             relay_api,
             relay_tunnel,
             credential_file,
+            agent_pairs,
             _dir: dir,
             relay_stop,
             relay_task,
@@ -246,6 +248,15 @@ impl Stack {
         let (stop, stopped) = reverse_core::shutdown::channel();
         let task = tokio::spawn(reverse_agent::run(config, stopped));
         SecondAgent { engine, stop, task }
+    }
+
+    /// Restarts the agent with the same saved credential, as a process restart would.
+    pub async fn restart_agent(&mut self) {
+        self.stop_agent().await;
+        let config = reverse_agent::Config::from_env(&env_of(self.agent_pairs.clone())).unwrap();
+        let (stop, stopped) = reverse_core::shutdown::channel();
+        self.agent_stop = stop;
+        self.agent_task = tokio::spawn(reverse_agent::run(config, stopped));
     }
 
     /// Stops only the agent, as a dropped connection would.

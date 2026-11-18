@@ -175,6 +175,10 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
   tags; the agent logs `models.tags_unknown` instead of guessing.
 - The relay forwards the tags in each LiteLLM deployment's `model_info.tags`
   and sets `model_info.mode = "embedding"` for embedding models.
+- The relay registers one deployment per `{account}/{model}` alias. Several
+  agents of the same account that announce the same model id share that alias
+  and are load-balanced by the relay; the deployment stays while at least one
+  agent serves it and is removed after the grace period once none does.
 
 Tags: `text`, `tools`, `vision`, `image`, `video`, `speech`, `embedding`,
 `rerank`.
