@@ -44,6 +44,29 @@ pub enum DiscoveryError {
     Json(#[from] serde_json::Error),
 }
 
+/// Looking up model metadata on the Hugging Face hub failed.
+///
+/// Lookups are enrichment, never a serving dependency: every failure degrades the tags of one
+/// model and is logged, it never stops the tunnel.
+#[derive(Debug, Error)]
+pub enum CatalogError {
+    /// The request itself failed.
+    #[error("model metadata request failed: {0}")]
+    Http(#[from] reqwest::Error),
+    /// The hub answered with an unexpected status.
+    #[error("model metadata answered {0}")]
+    Status(reqwest::StatusCode),
+    /// The metadata endpoint could not be built from the configured origin.
+    #[error("invalid model metadata url: {0}")]
+    Url(String),
+    /// The answer exceeded its size cap.
+    #[error("{0}")]
+    Body(String),
+    /// The answer is not the expected JSON.
+    #[error("model metadata is not valid JSON: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
 /// Opening or running the tunnel failed.
 #[derive(Debug, Error)]
 pub enum TunnelError {

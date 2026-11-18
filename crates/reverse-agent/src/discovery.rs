@@ -1,5 +1,6 @@
 //! Keeps a validated snapshot of the models the local engine serves.
 
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,11 +9,12 @@ use http_body_util::{BodyExt, Limited};
 use reverse_core::body::empty;
 use reverse_core::ids::ModelName;
 use reverse_core::shutdown::triggered;
-use reverse_core::wire::ModelsSnapshot;
+use reverse_core::wire::{ModelEntry, ModelTag, ModelsSnapshot};
 use serde::Deserialize;
 use tokio::sync::watch;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{Instant, MissedTickBehavior, interval};
 
+use crate::catalog::Catalog;
 use crate::error::DiscoveryError;
 use crate::upstream::Upstream;
 
@@ -21,12 +23,21 @@ const MAX_MODEL_LIST_BYTES: usize = 1024 * 1024;
 
 #[derive(Deserialize)]
 struct ModelList {
-    data: Vec<ModelEntry>,
+    data: Vec<EngineModel>,
 }
 
 #[derive(Deserialize)]
-struct ModelEntry {
+struct EngineModel {
     id: String,
+}
+
+/// What the operator declared for this agent.
+#[derive(Debug, Clone, Default)]
+pub struct Declared {
+    /// Models announced although the engine's `/v1/models` omits them.
+    pub extras: Vec<ModelName>,
+    /// Tags that override anything resolved from the hub.
+    pub tags: BTreeMap<ModelName, Vec<ModelTag>>,
 }
 
 /// The snapshot channel, starting before the first poll.
@@ -42,11 +53,16 @@ pub fn channel() -> (
 pub async fn run(
     upstream: Arc<Upstream>,
     every: Duration,
+    declared: Declared,
+    catalog: Option<Arc<Catalog>>,
+    budget: Duration,
     snapshots: watch::Sender<ModelsSnapshot>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ticker = interval(every);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut resolved: BTreeMap<ModelName, Vec<ModelTag>> = BTreeMap::new();
+    let mut unknown = HashSet::new();
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -56,8 +72,75 @@ pub async fn run(
             Ok(result) => result,
             Err(_) => Err(DiscoveryError::Timeout(FETCH_TIMEOUT)),
         };
-        publish(&snapshots, outcome);
+        if let Ok(ids) = &outcome {
+            let fresh = resolve_pass(
+                ids,
+                &declared,
+                catalog.as_deref(),
+                &resolved,
+                &mut unknown,
+                budget,
+            )
+            .await;
+            if !fresh.is_empty() {
+                resolved.extend(fresh);
+            }
+        }
+        publish(&snapshots, outcome, &declared, &resolved);
     }
+}
+
+/// Tags the announced models the hub has not classified yet.
+///
+/// One pass is bounded by `budget` so a slow or unreachable hub can never postpone snapshot
+/// publication by more than one lookup past it; unresolved models are retried by later
+/// cycles while the negative cache keeps them cheap.
+async fn resolve_pass(
+    ids: &[String],
+    declared: &Declared,
+    catalog: Option<&Catalog>,
+    settled: &BTreeMap<ModelName, Vec<ModelTag>>,
+    unknown: &mut HashSet<ModelName>,
+    budget: Duration,
+) -> BTreeMap<ModelName, Vec<ModelTag>> {
+    let mut fresh = BTreeMap::new();
+    let mut pending = BTreeSet::new();
+    pending.extend(ids.iter().filter_map(|id| ModelName::parse(id).ok()));
+    pending.extend(declared.extras.iter().cloned());
+    let deadline = Instant::now() + budget;
+    for name in pending {
+        if declared.tags.contains_key(&name)
+            || settled.contains_key(&name)
+            || fresh.contains_key(&name)
+        {
+            continue;
+        }
+        if Instant::now() >= deadline {
+            tracing::debug!("catalog.pass_budget_exhausted");
+            break;
+        }
+        match catalog {
+            Some(catalog) => match catalog.resolve(&name).await {
+                Some(tags) => {
+                    fresh.insert(name, tags);
+                }
+                None => {
+                    if unknown.insert(name.clone()) {
+                        tracing::warn!(
+                            model = %name,
+                            "models.tags_unknown; declare AGENT_MODEL_TAGS to classify it"
+                        );
+                    }
+                }
+            },
+            None => {
+                if unknown.insert(name.clone()) {
+                    tracing::debug!(model = %name, "models.tags_disabled");
+                }
+            }
+        }
+    }
+    fresh
 }
 
 async fn fetch(upstream: &Upstream) -> Result<Vec<String>, DiscoveryError> {
@@ -79,10 +162,12 @@ async fn fetch(upstream: &Upstream) -> Result<Vec<String>, DiscoveryError> {
 fn publish(
     snapshots: &watch::Sender<ModelsSnapshot>,
     outcome: Result<Vec<String>, DiscoveryError>,
+    declared: &Declared,
+    resolved: &BTreeMap<ModelName, Vec<ModelTag>>,
 ) {
     let (available, models, rejected) = match outcome {
         Ok(ids) => {
-            let (models, rejected) = validate(ids);
+            let (models, rejected) = assemble(ids, declared, resolved);
             (true, models, rejected)
         }
         Err(error) => {
@@ -106,49 +191,164 @@ fn publish(
     }
 }
 
-fn validate(ids: Vec<String>) -> (Vec<String>, Vec<String>) {
-    let mut accepted = Vec::new();
+/// Merges discovered ids with configured extras, validates them and attaches tags.
+///
+/// Precedence is operator declaration, then hub metadata; a model with neither carries no
+/// tags rather than a guess.
+fn assemble(
+    ids: Vec<String>,
+    declared: &Declared,
+    resolved: &BTreeMap<ModelName, Vec<ModelTag>>,
+) -> (Vec<ModelEntry>, Vec<String>) {
+    let mut announced = BTreeMap::<ModelName, ()>::new();
     let mut rejected = Vec::new();
     for id in ids {
         match ModelName::parse(&id) {
-            Ok(name) => accepted.push(name.as_str().to_owned()),
+            Ok(name) => {
+                announced.insert(name, ());
+            }
             Err(_) => rejected.push(id),
         }
     }
-    accepted.sort();
-    accepted.dedup();
-    (accepted, rejected)
+    for extra in &declared.extras {
+        announced.insert(extra.clone(), ());
+    }
+    let models = announced
+        .into_keys()
+        .map(|name| {
+            let mut tags = declared
+                .tags
+                .get(&name)
+                .or_else(|| resolved.get(&name))
+                .cloned()
+                .unwrap_or_default();
+            tags.sort();
+            tags.dedup();
+            ModelEntry {
+                id: name.as_str().to_owned(),
+                tags,
+            }
+        })
+        .collect();
+    (models, rejected)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn model(name: &str) -> ModelName {
+        ModelName::parse(name).unwrap()
+    }
+
     #[test]
-    fn validate_sorts_dedups_and_rejects() {
-        let (ok, bad) = validate(vec![
-            "b".into(),
-            "a".into(),
-            "b".into(),
-            "/models/x.gguf".into(),
-        ]);
-        assert_eq!(ok, ["a", "b"]);
+    fn assemble_sorts_dedups_and_rejects() {
+        let (models, bad) = assemble(
+            vec!["b".into(), "a".into(), "b".into(), "/models/x.gguf".into()],
+            &Declared::default(),
+            &BTreeMap::new(),
+        );
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
         assert_eq!(bad, ["/models/x.gguf"]);
+        assert!(models[0].tags.is_empty(), "unknown models carry no guess");
+    }
+
+    #[test]
+    fn operator_tags_win_over_hub_metadata_and_extras_are_merged() {
+        let declared = Declared {
+            extras: vec![model("perplexity-ai/pplx-embed-v1-0.6b")],
+            tags: BTreeMap::from([(
+                model("qwen3.8-flash-next"),
+                vec![ModelTag::Text, ModelTag::Tools],
+            )]),
+        };
+        let resolved = BTreeMap::from([
+            (
+                model("perplexity-ai/pplx-embed-v1-0.6b"),
+                vec![ModelTag::Embedding],
+            ),
+            (model("qwen3.8-flash-next"), vec![ModelTag::Text]),
+        ]);
+        let (models, rejected) = assemble(vec!["qwen3.8-flash-next".into()], &declared, &resolved);
+        assert!(rejected.is_empty());
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "perplexity-ai/pplx-embed-v1-0.6b");
+        assert_eq!(models[0].tags, vec![ModelTag::Embedding]);
+        assert_eq!(models[1].id, "qwen3.8-flash-next");
+        assert_eq!(models[1].tags, vec![ModelTag::Text, ModelTag::Tools]);
     }
 
     #[test]
     fn publish_bumps_revision_only_on_change() {
         let (tx, rx) = channel();
-        publish(&tx, Ok(vec!["m".into()]));
-        publish(&tx, Ok(vec!["m".into()]));
+        let declared = Declared::default();
+        let resolved = BTreeMap::new();
+        publish(&tx, Ok(vec!["m".into()]), &declared, &resolved);
+        publish(&tx, Ok(vec!["m".into()]), &declared, &resolved);
         assert_eq!(rx.borrow().revision, 1);
         assert!(rx.borrow().engine_available);
         publish(
             &tx,
             Err(DiscoveryError::Status(http::StatusCode::BAD_GATEWAY)),
+            &declared,
+            &resolved,
         );
         assert_eq!(rx.borrow().revision, 2);
         assert!(!rx.borrow().engine_available);
         assert!(rx.borrow().models.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pass_cut_by_the_budget_makes_no_lookup() {
+        let map = std::collections::HashMap::from([
+            (
+                "AGENT_RELAY_URL".to_owned(),
+                "http://127.0.0.1:8443".to_owned(),
+            ),
+            (
+                "AGENT_UPSTREAM_URL".to_owned(),
+                "http://127.0.0.1:30001".to_owned(),
+            ),
+            ("AGENT_HF_URL".to_owned(), "http://127.0.0.1:1".to_owned()),
+        ]);
+        let config = crate::config::Config::from_env(&reverse_core::config::Env::new(move |key| {
+            map.get(key).cloned()
+        }))
+        .unwrap();
+        let catalog = crate::catalog::Catalog::new(&config).unwrap();
+        let mut unknown = HashSet::new();
+
+        let fresh = resolve_pass(
+            &["m".to_owned()],
+            &Declared::default(),
+            Some(&catalog),
+            &BTreeMap::new(),
+            &mut unknown,
+            Duration::ZERO,
+        )
+        .await;
+        assert!(fresh.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pass_only_resolves_what_the_operator_did_not_declare() {
+        let declared = Declared {
+            extras: Vec::new(),
+            tags: BTreeMap::from([(model("m"), vec![ModelTag::Text])]),
+        };
+        let mut unknown = HashSet::new();
+
+        let fresh = resolve_pass(
+            &["m".to_owned()],
+            &declared,
+            None,
+            &BTreeMap::new(),
+            &mut unknown,
+            Duration::ZERO,
+        )
+        .await;
+        assert!(fresh.is_empty());
+        assert!(unknown.is_empty());
     }
 }

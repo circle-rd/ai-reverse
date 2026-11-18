@@ -197,6 +197,16 @@ must be written in English.** No exceptions.
   are rejected).
 - Model ids from the engine are validated once (`reverse_core::ids::ModelName`)
   before entering the snapshot; rejected ids are logged and dropped.
+- Announced models are the union of the engine's `/v1/models` and
+  `AGENT_EXTRA_MODELS`, deduplicated and sorted.
+- Capability tags resolve in one order: `AGENT_MODEL_TAGS` (operator), then the
+  hub's `pipeline_tag` mapped in `catalog.rs`, then no tag. Never infer tags
+  from the model name: names are not a stable classification and new families
+  would silently misclassify.
+- Hub lookups are enrichment: bounded by `AGENT_HF_TIMEOUT_SECS`, cached, with a
+  negative cache, one bounded pass per discovery cycle so a slow hub cannot
+  postpone the announcement of newly discovered models, `AGENT_HF_METADATA=off`
+  for air-gapped boxes, and no effect on serving when they fail.
 - Client ids and reserved prefixes are validated by `reverse_core::ids`; the
   reserved list exists because LiteLLM parses `provider/model` prefixes.
 - The tunnel protocol token is checked on upgrade; a mismatched `Upgrade`
@@ -251,7 +261,8 @@ crates/
     ├── src/enroll.rs            # pairing: /enroll/start, /enroll/poll, approval
     ├── src/credential.rs        # 0600 atomic credential file
     ├── src/tunnel.rs            # dial, upgrade, HTTP/2 serve, reconnect backoff
-    ├── src/discovery.rs         # engine /v1/models polling, validated snapshots
+    ├── src/discovery.rs         # engine /v1/models polling, extras, validated snapshots
+    ├── src/catalog.rs           # model tags from the Hugging Face pipeline_tag (cached)
     ├── src/proxy.rs             # request routing through the tunnel
     ├── src/upstream.rs          # engine HTTP client, key injection
     ├── src/hardware.rs          # self-reported host facts from /proc and /sys
@@ -272,6 +283,7 @@ crates/
 | `reverse-agent/tunnel.rs` | Connection lifecycle and backoff | route policy |
 | `reverse-agent/proxy.rs` | Serving the allowlisted routes | engine authentication |
 | `reverse-agent/upstream.rs` | Engine client and key injection | model routing |
+| `reverse-agent/catalog.rs` | Hub metadata lookup and tag mapping | engine or relay policy |
 | `main.rs` | Startup and shutdown | domain logic |
 
 ### File size limits
@@ -303,10 +315,11 @@ private helpers.
 
 - Unit tests live beside the code in `#[cfg(test)] mod tests`.
 - The agent's tests cover configuration validation, credential file semantics,
-  model-id validation and snapshot publication, hardware detection and the TLS
-  connector.
+  model-id validation, model-tag resolution (against a fake hub), snapshot
+  publication, hardware detection and the TLS connector.
 - No real relay, engine, network access or Docker is required for the tests of
-  this repository.
+  this repository. The one live hub lookup is an `#[ignore]`d test in
+  `catalog.rs`; run it manually when egress is available.
 
 ### Rules
 
@@ -342,6 +355,9 @@ private helpers.
   idle-stall guards apply in both directions.
 - Host facts are self-reported from `/proc` and `/sys` and are treated as
   untrusted text by the consumer.
+- Model metadata is fetched from the hub only when `AGENT_HF_METADATA` is `on`;
+  the request carries the model id and, when set, `AGENT_HF_TOKEN`. Nothing else
+  about the box leaves it. Turning the lookup off keeps ids on the box.
 - Runtime image: `scratch`, non-root (UID/GID 65532), read-only root filesystem,
   no shell, no package manager, `cap_drop: ALL`, `no-new-privileges`, core dumps
   disabled by the runtime.

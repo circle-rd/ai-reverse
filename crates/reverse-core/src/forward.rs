@@ -33,6 +33,7 @@ pub fn is_allowed_route(method: &Method, path: &str) -> bool {
             "/v1/chat/completions"
                 | "/v1/completions"
                 | "/v1/embeddings"
+                | "/v1/embedding"
                 | "/v1/responses"
                 | "/v1/messages"
         ),
@@ -90,10 +91,13 @@ mod tests {
     fn only_openai_routes_are_allowed() {
         assert!(is_allowed_route(&Method::GET, "/v1/models"));
         assert!(is_allowed_route(&Method::POST, "/v1/chat/completions"));
+        assert!(is_allowed_route(&Method::POST, "/v1/embeddings"));
+        assert!(is_allowed_route(&Method::POST, "/v1/embedding"));
         assert!(!is_allowed_route(&Method::POST, "/v1/models"));
         assert!(!is_allowed_route(&Method::GET, "/v1/chat/completions"));
         assert!(!is_allowed_route(&Method::POST, "/flush_cache"));
         assert!(!is_allowed_route(&Method::POST, "/v1/chat/completions/"));
+        assert!(!is_allowed_route(&Method::POST, "/v1/embedding/"));
         assert!(!is_allowed_route(&Method::DELETE, "/v1/models"));
     }
 

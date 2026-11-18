@@ -230,6 +230,12 @@ impl BaseUrl {
                 .parse::<IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback())
     }
+
+    /// `scheme://authority`, an origin suitable for joining an API path onto.
+    #[must_use]
+    pub fn origin(&self) -> String {
+        format!("{}://{}", self.scheme, self.authority)
+    }
 }
 
 #[cfg(test)]
