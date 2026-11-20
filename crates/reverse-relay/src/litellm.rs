@@ -77,6 +77,12 @@ struct Row {
     model_info: Option<RowInfo>,
 }
 
+/// LiteLLM persists a capability flag we omit as JSON `null` rather than dropping
+/// the key, so a flag is accepted either as a boolean or as null.
+fn null_to_false<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(false))
+}
+
 #[derive(Deserialize)]
 struct RowInfo {
     id: Option<String>,
@@ -86,15 +92,15 @@ struct RowInfo {
     mode: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_false")]
     supports_function_calling: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_false")]
     supports_vision: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_false")]
     supports_video_input: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_false")]
     supports_audio_input: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_false")]
     supports_audio_output: bool,
 }
 
@@ -259,5 +265,49 @@ impl LiteLlm {
         )
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_flags_litellm_persisted_as_null() {
+        // LiteLLM stores omitted capability flags as JSON null, not as absent keys.
+        let list: ModelInfoList = serde_json::from_str(
+            r#"{"data":[{"model_info":{"id":"1","managed_by":"reverse-relay","reverse_name":"bmz/m","created_by":"bmz","tags":["text"],"supports_function_calling":true,"supports_vision":null,"supports_video_input":null,"supports_audio_input":null,"supports_audio_output":null}}]}"#,
+        )
+        .expect("a row with null flags");
+        let managed = list_managed_rows(&list);
+        assert_eq!(managed.len(), 1);
+        assert!(managed[0].supports.function_calling);
+        assert!(!managed[0].supports.vision);
+    }
+
+    fn list_managed_rows(list: &ModelInfoList) -> Vec<Managed> {
+        let mut seen = HashSet::new();
+        list.data
+            .iter()
+            .filter_map(|row| row.model_info.as_ref())
+            .filter(|info| info.managed_by.as_deref() == Some(MANAGED_BY))
+            .filter_map(|info| {
+                let id = info.id.as_ref()?;
+                seen.insert(id.clone()).then_some(Managed {
+                    id: id.clone(),
+                    reverse_name: info.reverse_name.clone(),
+                    created_by: info.created_by.clone(),
+                    tags: info.tags.clone(),
+                    mode: info.mode.clone(),
+                    supports: Supports {
+                        function_calling: info.supports_function_calling,
+                        vision: info.supports_vision,
+                        video_input: info.supports_video_input,
+                        audio_input: info.supports_audio_input,
+                        audio_output: info.supports_audio_output,
+                    },
+                })
+            })
+            .collect()
     }
 }
