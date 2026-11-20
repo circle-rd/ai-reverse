@@ -12,7 +12,7 @@ use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::error::LiteLlmError;
-use crate::litellm::{LiteLlm, Managed};
+use crate::litellm::{LiteLlm, Managed, Publish};
 use crate::registry::Registry;
 
 const FINAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,22 +51,28 @@ pub struct Plan {
 
 /// Diffs the wanted pairs against what LiteLLM holds.
 ///
-/// A deployment whose tags changed is replaced: LiteLLM has no partial update for
-/// `model_info`, and a stale classification is worse than one more round trip.
+/// A deployment whose tags, owner or capability flags changed is replaced: LiteLLM has no
+/// partial update for `model_info`, and a stale classification is worse than one more round
+/// trip.
 #[must_use]
 pub fn plan(wanted: &BTreeMap<(ClientId, ModelName), Vec<ModelTag>>, actual: &[Managed]) -> Plan {
-    let wanted_by_name: HashMap<String, &Vec<ModelTag>> = wanted
+    let wanted_by_name: HashMap<String, (&ClientId, &Vec<ModelTag>)> = wanted
         .iter()
-        .map(|((client, model), tags)| (format!("{client}/{model}"), tags))
+        .map(|((client, model), tags)| (format!("{client}/{model}"), (client, tags)))
         .collect();
     let mut kept = HashSet::new();
     let mut delete = Vec::new();
     for row in actual {
         let keep = match &row.reverse_name {
-            Some(name) => wanted_by_name.get(name).is_some_and(|tags| {
+            Some(name) => wanted_by_name.get(name).is_some_and(|(client, tags)| {
                 let wanted_tags: Vec<String> =
                     tags.iter().map(|tag| tag.as_str().to_owned()).collect();
-                row.tags == wanted_tags && kept.insert(name.clone())
+                let publish = Publish::from_tags(tags);
+                row.tags == wanted_tags
+                    && row.created_by.as_deref() == Some(client.as_str())
+                    && row.mode.as_deref() == publish.mode
+                    && row.supports == publish.supports
+                    && kept.insert(name.clone())
             }),
             None => false,
         };
@@ -199,6 +205,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::litellm::Supports;
 
     fn pair(client: &str, model: &str) -> (ClientId, ModelName) {
         (
@@ -217,10 +224,26 @@ mod tests {
     }
 
     fn row(id: &str, name: Option<&str>, tags: &[&str]) -> Managed {
+        let parsed: Vec<ModelTag> = tags.iter().filter_map(|tag| ModelTag::parse(tag)).collect();
+        let publish = Publish::from_tags(&parsed);
         Managed {
             id: id.to_owned(),
             reverse_name: name.map(str::to_owned),
+            created_by: name
+                .and_then(|name| name.split_once('/'))
+                .map(|(owner, _)| owner.to_owned()),
             tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            mode: publish.mode.map(str::to_owned),
+            supports: publish.supports,
+        }
+    }
+
+    fn legacy_row(id: &str, name: &str, tags: &[&str]) -> Managed {
+        Managed {
+            created_by: None,
+            mode: None,
+            supports: Supports::default(),
+            ..row(id, Some(name), tags)
         }
     }
 
@@ -255,6 +278,15 @@ mod tests {
         assert_eq!(plan.delete, vec!["1".to_owned()]);
         assert_eq!(plan.create.len(), 1);
         assert_eq!(plan.create[0].tags, vec![ModelTag::Text, ModelTag::Tools]);
+    }
+
+    #[test]
+    fn replaces_a_deployment_missing_the_owner_or_capability_flags() {
+        let wanted = wanted(&[("tester", "m", &[ModelTag::Text, ModelTag::Tools])]);
+        let actual = [legacy_row("1", "tester/m", &["text", "tools"])];
+        let plan = plan(&wanted, &actual);
+        assert_eq!(plan.delete, vec!["1".to_owned()]);
+        assert_eq!(plan.create.len(), 1);
     }
 
     #[test]

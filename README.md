@@ -214,27 +214,44 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
 - **Discovery.** The agent polls the engine's `/v1/models`. Engines commonly
   omit auxiliary lanes: `AGENT_EXTRA_MODELS` announces ids such as an embedding
   model the engine serves on `/v1/embeddings` without listing it.
-- **Classification.** The agent asks the Hugging Face model API for the model's
-  `pipeline_tag`, the hub's normalized classification, and maps it to a tag
-  (`feature-extraction` → `embedding`, `text-generation` → `text`,
-  `image-text-to-text` → `text` + `vision`, `text-to-image` → `image`,
-  `automatic-speech-recognition` → `speech`, `text-ranking` → `rerank`, …).
-  Results are cached; unknown or unreachable models are re-checked after 15
-  minutes. One bounded classification pass runs per poll cycle
-  (`AGENT_HF_TIMEOUT_SECS`), so a slow hub can never postpone the announcement
-  of newly discovered models: they are announced first, then enriched.
-- **Override.** `AGENT_MODEL_TAGS` wins over the hub, for internal ids the hub
-  does not know and for facts the hub does not record, like tool calling:
+- **Classification.** The agent merges three sources, in order: the operator's
+  `AGENT_MODEL_TAGS`, the capability hints the engine reports in each
+  `/v1/models` entry (`capabilities` or `tags`, including
+  `input_modalities`/`output_modalities`), and the Hugging Face model API's
+  `pipeline_tag` and `tags`. Typical hub mappings are `feature-extraction` →
+  `embedding`, `text-generation` → `text`, `image-text-to-text` → `text` +
+  `vision`, `text-to-image` → `image`, `automatic-speech-recognition` →
+  `speech`, and `text-ranking` → `rerank`. Results are cached; unknown or
+  unreachable models are re-checked after 15 minutes. One bounded
+  classification pass runs per poll cycle (`AGENT_HF_TIMEOUT_SECS`), so a slow
+  hub can never postpone the announcement of newly discovered models: they are
+  announced first, then enriched.
+- **Override.** `AGENT_MODEL_TAGS` wins over the engine and the hub, for
+  internal ids neither knows and for facts they do not record, like tool
+  calling:
 
   ```bash
   AGENT_EXTRA_MODELS=perplexity-ai/pplx-embed-v1-0.6b
   AGENT_MODEL_TAGS=qwen3.8-flash-next=text,tools
   ```
 
-- A model with neither hub metadata nor an operator declaration carries **no**
-  tags; the agent logs `models.tags_unknown` instead of guessing.
-- The relay forwards the tags in each LiteLLM deployment's `model_info.tags`
-  and sets `model_info.mode = "embedding"` for embedding models.
+- A model with no source and no operator declaration carries **no** tags; the
+  agent logs `models.tags_unknown` instead of guessing.
+- The relay publishes the tags in `model_info.tags` and maps them to LiteLLM's
+  capability fields: `tools` → `supports_function_calling`, `vision` →
+  `supports_vision`, `video` → `supports_video_input`, `speech` →
+  `supports_audio_input` + `supports_audio_output`, and `embedding` →
+  `model_info.mode = "embedding"`. A flag is only set when its tag is present,
+  so an unclassified model is never asserted to lack a capability. Image and
+  rerank models keep their tag but stay on the chat surface: the relay does not
+  serve their dedicated routes.
+- Each deployment carries `model_info.managed_by = "reverse-relay"` and
+  `model_info.created_by = "{account}"`, in addition to `client_id` and
+  `reverse_name`. This distinguishes models learned by the relay from models
+  configured directly in LiteLLM, even when both have the same owner.
+- Changing tags, owner or capability flags replaces the deployment on the next
+  reconcile: LiteLLM has no partial `model_info` update, so the old row is
+  deleted and recreated with the new classification.
 - The relay registers one deployment per `{account}/{model}` alias. Several
   agents of the same account that announce the same model id share that alias
   and are load-balanced by the relay; the deployment stays while at least one

@@ -119,6 +119,27 @@ impl ModelTag {
             Self::Rerank => "rerank",
         }
     }
+
+    /// Maps a capability hint reported by an engine or a model hub.
+    ///
+    /// Hints are free-form metadata, so unlike [`ModelTag::parse`] this accepts common
+    /// synonyms and separators. Unknown hints are ignored rather than guessed from a name.
+    #[must_use]
+    pub fn from_hint(raw: &str) -> Option<Self> {
+        let normalized = raw.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+        Some(match normalized.as_str() {
+            "text" | "chat" | "completion" | "text-generation" => Self::Text,
+            "tools" | "tool" | "tool-calling" | "function-calling" | "functions" => Self::Tools,
+            "vision" | "image-input" | "image-understanding" => Self::Vision,
+            "image" | "image-generation" | "text-to-image" => Self::Image,
+            "video" | "video-input" | "video-generation" | "text-to-video" => Self::Video,
+            "speech" | "audio" | "audio-input" | "audio-output" | "asr" | "tts"
+            | "transcription" => Self::Speech,
+            "embedding" | "embeddings" | "embed" => Self::Embedding,
+            "rerank" | "reranking" | "rank" => Self::Rerank,
+            _ => return None,
+        })
+    }
 }
 
 /// One model the agent announces to the relay.
@@ -197,6 +218,22 @@ mod tests {
             assert_eq!(ModelTag::parse(tag.as_str()), Some(tag));
         }
         assert_eq!(ModelTag::parse("embeddings"), None);
+    }
+
+    #[test]
+    fn capability_hints_accept_common_synonyms() {
+        assert_eq!(
+            ModelTag::from_hint("function_calling"),
+            Some(ModelTag::Tools)
+        );
+        assert_eq!(ModelTag::from_hint("Tool Calling"), Some(ModelTag::Tools));
+        assert_eq!(ModelTag::from_hint("embeddings"), Some(ModelTag::Embedding));
+        assert_eq!(ModelTag::from_hint("audio-input"), Some(ModelTag::Speech));
+        assert_eq!(
+            ModelTag::from_hint("image-generation"),
+            Some(ModelTag::Image)
+        );
+        assert_eq!(ModelTag::from_hint("unrelated-metadata"), None);
     }
 
     #[test]

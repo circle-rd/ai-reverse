@@ -26,6 +26,7 @@ async fn registers_the_served_model_and_streams_a_completion() {
         "http://relay.test/tester/v1"
     );
     assert_eq!(row["model_info"]["managed_by"], "reverse-relay");
+    assert_eq!(row["model_info"]["created_by"], "tester");
 
     let reply = send(
         stack.relay_api,
@@ -75,6 +76,8 @@ async fn an_embedding_model_outside_the_engine_list_is_announced_and_tagged() {
     .await;
     assert_eq!(llm["model_info"]["tags"][0], "text");
     assert_eq!(llm["model_info"]["tags"][1], "tools");
+    assert_eq!(llm["model_info"]["supports_function_calling"], true);
+    assert_eq!(llm["model_info"]["created_by"], "tester");
     stack.shutdown().await;
 }
 

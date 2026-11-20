@@ -161,13 +161,11 @@ fn tags_from(metadata: &Metadata) -> Vec<ModelTag> {
         .and_then(classify)
         .map(<[ModelTag]>::to_vec)
         .unwrap_or_default();
-    if tags.is_empty() {
-        // The hub repeats the pipeline tag inside `tags`; a model can also carry a
-        // supertype there when `pipeline_tag` is absent.
-        for tag in &metadata.tags {
-            if let Some(found) = classify(tag) {
-                tags.extend_from_slice(found);
-            }
+    // The hub repeats the pipeline tag inside `tags` and also records capabilities
+    // such as tool calling there; merge both instead of using `tags` only as a fallback.
+    for tag in &metadata.tags {
+        if let Some(found) = classify(tag) {
+            tags.extend_from_slice(found);
         }
     }
     tags.sort();
@@ -176,7 +174,7 @@ fn tags_from(metadata: &Metadata) -> Vec<ModelTag> {
 }
 
 fn classify(pipeline_tag: &str) -> Option<&'static [ModelTag]> {
-    use ModelTag::{Embedding, Image, Rerank, Speech, Text, Video, Vision};
+    use ModelTag::{Embedding, Image, Rerank, Speech, Text, Tools, Video, Vision};
     Some(match pipeline_tag {
         "text-generation"
         | "text2text-generation"
@@ -186,20 +184,32 @@ fn classify(pipeline_tag: &str) -> Option<&'static [ModelTag]> {
         | "question-answering"
         | "summarization"
         | "translation" => &[Text],
-        "feature-extraction" | "sentence-similarity" => &[Embedding],
-        "text-ranking" => &[Rerank],
+        "feature-extraction" | "sentence-similarity" | "sentence-transformers" => &[Embedding],
+        "text-ranking" | "reranking" => &[Rerank],
+        "tool-calling" | "function-calling" | "function_calling" | "tool_calling" => &[Tools],
         "image-text-to-text" | "visual-question-answering" | "image-to-text" => &[Text, Vision],
+        "audio-text-to-text" => &[Text, Speech],
+        "video-text-to-text" => &[Text, Video],
+        "any-to-any" => &[Text, Vision, Speech, Video],
         "image-classification"
         | "object-detection"
         | "image-segmentation"
         | "depth-estimation"
         | "zero-shot-image-classification"
-        | "image-feature-extraction" => &[Vision],
+        | "zero-shot-object-detection"
+        | "image-feature-extraction"
+        | "mask-generation"
+        | "keypoint-detection" => &[Vision],
         "text-to-image" | "image-to-image" | "unconditional-image-generation" => &[Image],
-        "text-to-video" | "image-to-video" | "video-classification" | "text-to-3d" => &[Video],
+        "text-to-video"
+        | "image-to-video"
+        | "video-to-video"
+        | "video-classification"
+        | "text-to-3d" => &[Video],
         "automatic-speech-recognition"
         | "audio-classification"
         | "text-to-speech"
+        | "text-to-audio"
         | "audio-to-audio"
         | "voice-activity-detection" => &[Speech],
         _ => return None,
@@ -274,6 +284,18 @@ mod tests {
         );
         assert!(tags_from(&metadata(None, &["region:us"])).is_empty());
         assert!(tags_from(&metadata(Some("custom-unknown-tag"), &[])).is_empty());
+    }
+
+    #[test]
+    fn hub_tags_add_capabilities_beyond_the_pipeline_tag() {
+        assert_eq!(
+            tags_from(&metadata(Some("text-generation"), &["tool-calling"])),
+            vec![ModelTag::Text, ModelTag::Tools]
+        );
+        assert_eq!(
+            tags_from(&metadata(None, &["audio-text-to-text"])),
+            vec![ModelTag::Text, ModelTag::Speech]
+        );
     }
 
     struct FakeHub {

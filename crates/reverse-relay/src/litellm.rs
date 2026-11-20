@@ -21,8 +21,50 @@ pub struct Managed {
     pub id: String,
     /// `{client_id}/{model}` as registered, if recorded.
     pub reverse_name: Option<String>,
+    /// Account that owns the model, recorded in `model_info.created_by`.
+    pub created_by: Option<String>,
     /// Capability tags recorded in `model_info`, as sent.
     pub tags: Vec<String>,
+    /// Routing mode recorded in `model_info`.
+    pub mode: Option<String>,
+    /// Capability flags recorded in `model_info`.
+    pub supports: Supports,
+}
+
+/// Capability flags this relay publishes in `model_info`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Supports {
+    pub function_calling: bool,
+    pub vision: bool,
+    pub video_input: bool,
+    pub audio_input: bool,
+    pub audio_output: bool,
+}
+
+/// The LiteLLM fields derived from the announced capability tags.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Publish {
+    pub mode: Option<&'static str>,
+    pub supports: Supports,
+}
+
+impl Publish {
+    pub(crate) fn from_tags(tags: &[ModelTag]) -> Self {
+        let has = |tag| tags.contains(&tag);
+        // Only embedding has a distinct routing mode on the routes the relay serves;
+        // image and rerank models are still tagged but stay on the chat surface.
+        let mode = has(ModelTag::Embedding).then_some("embedding");
+        Self {
+            mode,
+            supports: Supports {
+                function_calling: has(ModelTag::Tools),
+                vision: has(ModelTag::Vision),
+                video_input: has(ModelTag::Video),
+                audio_input: has(ModelTag::Speech),
+                audio_output: has(ModelTag::Speech),
+            },
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -40,8 +82,20 @@ struct RowInfo {
     id: Option<String>,
     managed_by: Option<String>,
     reverse_name: Option<String>,
+    created_by: Option<String>,
+    mode: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    supports_function_calling: bool,
+    #[serde(default)]
+    supports_vision: bool,
+    #[serde(default)]
+    supports_video_input: bool,
+    #[serde(default)]
+    supports_audio_input: bool,
+    #[serde(default)]
+    supports_audio_output: bool,
 }
 
 #[derive(Serialize)]
@@ -62,10 +116,21 @@ struct LiteLlmParams<'a> {
 struct NewModelInfo<'a> {
     managed_by: &'static str,
     client_id: &'a str,
+    created_by: &'a str,
     reverse_name: String,
     tags: Vec<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supports_function_calling: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supports_vision: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supports_video_input: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supports_audio_input: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supports_audio_output: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -137,7 +202,16 @@ impl LiteLlm {
                 seen.insert(id.clone()).then_some(Managed {
                     id,
                     reverse_name: info.reverse_name,
+                    created_by: info.created_by,
                     tags: info.tags,
+                    mode: info.mode,
+                    supports: Supports {
+                        function_calling: info.supports_function_calling,
+                        vision: info.supports_vision,
+                        video_input: info.supports_video_input,
+                        audio_input: info.supports_audio_input,
+                        audio_output: info.supports_audio_output,
+                    },
                 })
             })
             .collect())
@@ -151,8 +225,7 @@ impl LiteLlm {
         tags: &[ModelTag],
     ) -> Result<(), LiteLlmError> {
         let name = format!("{client}/{model}");
-        // LiteLLM reads `mode` from `model_info` to route embeddings correctly.
-        let mode = tags.contains(&ModelTag::Embedding).then_some("embedding");
+        let publish = Publish::from_tags(tags);
         let body = NewModel {
             model_name: name.clone(),
             litellm_params: LiteLlmParams {
@@ -163,9 +236,15 @@ impl LiteLlm {
             model_info: NewModelInfo {
                 managed_by: MANAGED_BY,
                 client_id: client.as_str(),
+                created_by: client.as_str(),
                 reverse_name: name,
                 tags: tags.iter().map(|tag| tag.as_str()).collect(),
-                mode,
+                mode: publish.mode,
+                supports_function_calling: publish.supports.function_calling.then_some(true),
+                supports_vision: publish.supports.vision.then_some(true),
+                supports_video_input: publish.supports.video_input.then_some(true),
+                supports_audio_input: publish.supports.audio_input.then_some(true),
+                supports_audio_output: publish.supports.audio_output.then_some(true),
             },
         };
         Self::send(self.request(Method::POST, "model/new")?.json(&body)).await?;
