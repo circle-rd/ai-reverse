@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use reqwest::{Client, StatusCode, Url, redirect};
 use reverse_core::ids::ModelName;
 use reverse_core::secret::SecretString;
-use reverse_core::wire::ModelTag;
+use reverse_core::wire::{AuthorSafetyClaim, ModelMetadata, ModelTag};
 use serde::Deserialize;
 
 use crate::config::Config;
@@ -31,21 +31,31 @@ struct Metadata {
     tags: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct Profile {
+    #[serde(default, alias = "avatarUrl")]
+    avatar_url: Option<String>,
+}
+
 enum Cached {
-    Tags(Vec<ModelTag>),
+    Metadata(ModelMetadata),
     Missing(Instant),
 }
 
-/// Resolves and caches model tags from the Hugging Face hub.
+enum CachedAvatar {
+    Url(String),
+    Missing(Instant),
+}
+
 pub struct Catalog {
     http: Client,
     base: Url,
     token: Option<SecretString>,
     cache: Mutex<HashMap<ModelName, Cached>>,
+    owner_cache: Mutex<HashMap<String, CachedAvatar>>,
 }
 
 impl Catalog {
-    /// Builds a client for the configured hub endpoint.
     pub fn new(config: &Config) -> Result<Self, CatalogError> {
         let http = Client::builder()
             .timeout(config.hf_timeout)
@@ -59,21 +69,21 @@ impl Catalog {
                 .map_err(|e| CatalogError::Url(e.to_string()))?,
             token: config.hf_token.clone(),
             cache: Mutex::new(HashMap::new()),
+            owner_cache: Mutex::new(HashMap::new()),
         })
     }
 
-    /// The tags of one model, or `None` when the hub has no usable metadata.
-    pub async fn resolve(&self, model: &ModelName) -> Option<Vec<ModelTag>> {
-        if let Some(tags) = self.cached(model) {
-            return Some(tags);
+    pub async fn resolve(&self, model: &ModelName) -> Option<ModelMetadata> {
+        if let Some(metadata) = self.cached(model) {
+            return Some(metadata);
         }
         if self.in_backoff(model) {
             return None;
         }
         match self.fetch(model).await {
-            Ok(Some(tags)) => {
-                self.remember(model, Cached::Tags(tags.clone()));
-                Some(tags)
+            Ok(Some(metadata)) => {
+                self.remember(model, Cached::Metadata(metadata.clone()));
+                Some(metadata)
             }
             Ok(None) => {
                 tracing::debug!(model = %model, "catalog.not_found");
@@ -88,9 +98,9 @@ impl Catalog {
         }
     }
 
-    fn cached(&self, model: &ModelName) -> Option<Vec<ModelTag>> {
+    fn cached(&self, model: &ModelName) -> Option<ModelMetadata> {
         match self.lock().get(model) {
-            Some(Cached::Tags(tags)) => Some(tags.clone()),
+            Some(Cached::Metadata(metadata)) => Some(metadata.clone()),
             _ => None,
         }
     }
@@ -110,7 +120,7 @@ impl Catalog {
         self.cache.lock().expect("catalog cache lock poisoned")
     }
 
-    async fn fetch(&self, model: &ModelName) -> Result<Option<Vec<ModelTag>>, CatalogError> {
+    async fn fetch(&self, model: &ModelName) -> Result<Option<ModelMetadata>, CatalogError> {
         let mut url = self
             .base
             .join(&format!("api/models/{model}"))
@@ -122,19 +132,135 @@ impl Catalog {
         if let Some(token) = &self.token {
             request = request.bearer_auth(token.expose());
         }
-        let response = request.send().await?;
-        match response.status() {
-            StatusCode::OK => {}
-            // A private or gated repository, or an id the hub does not have.
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => {
-                return Ok(None);
+        let owner = hub_owner(model).map(str::to_owned);
+        let model_lookup = async move {
+            let response = request.send().await?;
+            match response.status() {
+                StatusCode::OK => {}
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => {
+                    return Ok(None);
+                }
+                status => return Err(CatalogError::Status(status)),
             }
-            status => return Err(CatalogError::Status(status)),
+            let body = read_bounded(response, MAX_METADATA_BYTES).await?;
+            Ok(Some(serde_json::from_slice::<Metadata>(&body)?))
+        };
+        let avatar_lookup = async {
+            match owner.as_deref() {
+                Some(owner) => self.avatar_for(owner).await,
+                None => None,
+            }
+        };
+        let (source, avatar_url) = tokio::join!(model_lookup, avatar_lookup);
+        let Some(source) = source? else {
+            return Ok(None);
+        };
+        let mut metadata = metadata_from(&source);
+        if let Some(owner) = owner {
+            metadata.hub_owner = Some(owner);
+            metadata.hub_avatar_url = avatar_url;
         }
-        let body = read_bounded(response, MAX_METADATA_BYTES).await?;
-        let metadata: Metadata = serde_json::from_slice(&body)?;
-        Ok(Some(tags_from(&metadata)))
+        Ok(Some(metadata))
     }
+
+    async fn avatar_for(&self, owner: &str) -> Option<String> {
+        if let Some(cached) = self.cached_avatar(owner) {
+            return cached;
+        }
+        let result = self.fetch_avatar(owner).await;
+        let cached = match result {
+            Ok(Some(url)) => CachedAvatar::Url(url),
+            Ok(None) => CachedAvatar::Missing(Instant::now()),
+            Err(error) => {
+                tracing::warn!(owner, %error, "catalog.owner_avatar_lookup_failed");
+                CachedAvatar::Missing(Instant::now())
+            }
+        };
+        let avatar = match &cached {
+            CachedAvatar::Url(url) => Some(url.clone()),
+            CachedAvatar::Missing(_) => None,
+        };
+        self.owner_cache
+            .lock()
+            .expect("catalog owner cache lock poisoned")
+            .insert(owner.to_owned(), cached);
+        avatar
+    }
+
+    fn cached_avatar(&self, owner: &str) -> Option<Option<String>> {
+        match self
+            .owner_cache
+            .lock()
+            .expect("catalog owner cache lock poisoned")
+            .get(owner)
+        {
+            Some(CachedAvatar::Url(url)) => Some(Some(url.clone())),
+            Some(CachedAvatar::Missing(at)) if at.elapsed() < NEGATIVE_TTL => Some(None),
+            _ => None,
+        }
+    }
+
+    async fn fetch_avatar(&self, owner: &str) -> Result<Option<String>, CatalogError> {
+        let (user, organization) = tokio::join!(
+            self.fetch_profile("users", owner),
+            self.fetch_profile("organizations", owner),
+        );
+        match (user, organization) {
+            (Ok(Some(url)), _) | (_, Ok(Some(url))) => Ok(Some(url)),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            (Ok(None), Ok(None)) => Ok(None),
+        }
+    }
+
+    async fn fetch_profile(&self, kind: &str, owner: &str) -> Result<Option<String>, CatalogError> {
+        let mut url = self
+            .base
+            .join("api/")
+            .map_err(|e| CatalogError::Url(e.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|_| CatalogError::Url("hub origin cannot accept path segments".into()))?
+            .extend([kind, owner, "overview"]);
+        let response = self.http.get(url).send().await?;
+        match response.status() {
+            StatusCode::OK => {
+                let body = read_bounded(response, MAX_METADATA_BYTES).await?;
+                let profile: Profile = serde_json::from_slice(&body)?;
+                Ok(profile
+                    .avatar_url
+                    .as_deref()
+                    .and_then(|raw| self.trusted_avatar_url(raw)))
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => Ok(None),
+            status => Err(CatalogError::Status(status)),
+        }
+    }
+
+    fn trusted_avatar_url(&self, raw: &str) -> Option<String> {
+        let url = Url::parse(raw).ok()?;
+        let host = url.host_str()?;
+        let trusted_host = self.base.host_str()?;
+        if url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some_and(|port| port != 443)
+            || !(is_subdomain(host, trusted_host) || is_subdomain(host, "huggingface.co"))
+        {
+            return None;
+        }
+        Some(url.to_string())
+    }
+}
+
+fn is_subdomain(host: &str, root: &str) -> bool {
+    host == root
+        || host
+            .strip_suffix(root)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn hub_owner(model: &ModelName) -> Option<&str> {
+    let (owner, repo) = model.as_str().split_once('/')?;
+    (!owner.is_empty() && !repo.is_empty() && !repo.contains('/')).then_some(owner)
 }
 
 async fn read_bounded(
@@ -154,6 +280,32 @@ async fn read_bounded(
 }
 
 /// Maps the hub's normalized classification to our tags.
+fn metadata_from(source: &Metadata) -> ModelMetadata {
+    ModelMetadata {
+        tags: tags_from(source),
+        author_safety_claim: safety_claim_from(&source.tags),
+        ..ModelMetadata::default()
+    }
+}
+
+fn safety_claim_from(tags: &[String]) -> Option<AuthorSafetyClaim> {
+    let mut uncensored = false;
+    let mut abliterated = false;
+    for tag in tags {
+        match tag.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "uncensored" => uncensored = true,
+            "abliterated" => abliterated = true,
+            _ => {}
+        }
+    }
+    match (uncensored, abliterated) {
+        (true, true) => Some(AuthorSafetyClaim::UncensoredAndAbliterated),
+        (true, false) => Some(AuthorSafetyClaim::Uncensored),
+        (false, true) => Some(AuthorSafetyClaim::Abliterated),
+        (false, false) => None,
+    }
+}
+
 fn tags_from(metadata: &Metadata) -> Vec<ModelTag> {
     let mut tags = metadata
         .pipeline_tag
@@ -161,13 +313,11 @@ fn tags_from(metadata: &Metadata) -> Vec<ModelTag> {
         .and_then(classify)
         .map(<[ModelTag]>::to_vec)
         .unwrap_or_default();
-    if tags.is_empty() {
-        // The hub repeats the pipeline tag inside `tags`; a model can also carry a
-        // supertype there when `pipeline_tag` is absent.
-        for tag in &metadata.tags {
-            if let Some(found) = classify(tag) {
-                tags.extend_from_slice(found);
-            }
+    // The hub repeats the pipeline tag inside `tags` and also records capabilities
+    // such as tool calling there; merge both instead of using `tags` only as a fallback.
+    for tag in &metadata.tags {
+        if let Some(found) = classify(tag) {
+            tags.extend_from_slice(found);
         }
     }
     tags.sort();
@@ -176,7 +326,7 @@ fn tags_from(metadata: &Metadata) -> Vec<ModelTag> {
 }
 
 fn classify(pipeline_tag: &str) -> Option<&'static [ModelTag]> {
-    use ModelTag::{Embedding, Image, Rerank, Speech, Text, Video, Vision};
+    use ModelTag::{Embedding, Image, Rerank, Speech, Text, Tools, Video, Vision};
     Some(match pipeline_tag {
         "text-generation"
         | "text2text-generation"
@@ -186,20 +336,32 @@ fn classify(pipeline_tag: &str) -> Option<&'static [ModelTag]> {
         | "question-answering"
         | "summarization"
         | "translation" => &[Text],
-        "feature-extraction" | "sentence-similarity" => &[Embedding],
-        "text-ranking" => &[Rerank],
+        "feature-extraction" | "sentence-similarity" | "sentence-transformers" => &[Embedding],
+        "text-ranking" | "reranking" => &[Rerank],
+        "tool-calling" | "function-calling" | "function_calling" | "tool_calling" => &[Tools],
         "image-text-to-text" | "visual-question-answering" | "image-to-text" => &[Text, Vision],
+        "audio-text-to-text" => &[Text, Speech],
+        "video-text-to-text" => &[Text, Video],
+        "any-to-any" => &[Text, Vision, Speech, Video],
         "image-classification"
         | "object-detection"
         | "image-segmentation"
         | "depth-estimation"
         | "zero-shot-image-classification"
-        | "image-feature-extraction" => &[Vision],
+        | "zero-shot-object-detection"
+        | "image-feature-extraction"
+        | "mask-generation"
+        | "keypoint-detection" => &[Vision],
         "text-to-image" | "image-to-image" | "unconditional-image-generation" => &[Image],
-        "text-to-video" | "image-to-video" | "video-classification" | "text-to-3d" => &[Video],
+        "text-to-video"
+        | "image-to-video"
+        | "video-to-video"
+        | "video-classification"
+        | "text-to-3d" => &[Video],
         "automatic-speech-recognition"
         | "audio-classification"
         | "text-to-speech"
+        | "text-to-audio"
         | "audio-to-audio"
         | "voice-activity-detection" => &[Speech],
         _ => return None,
@@ -207,183 +369,5 @@ fn classify(pipeline_tag: &str) -> Option<&'static [ModelTag]> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::convert::Infallible;
-    use std::net::SocketAddr;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use bytes::Bytes;
-    use http::{Request, Response, StatusCode, header};
-    use http_body_util::Full;
-    use hyper::body::Incoming;
-    use hyper::server::conn::http1;
-    use hyper::service::service_fn;
-    use hyper_util::rt::TokioIo;
-    use tokio::net::TcpListener;
-
-    use super::*;
-
-    fn model(name: &str) -> ModelName {
-        ModelName::parse(name).unwrap()
-    }
-
-    fn metadata(pipeline_tag: Option<&str>, tags: &[&str]) -> Metadata {
-        Metadata {
-            pipeline_tag: pipeline_tag.map(str::to_owned),
-            tags: tags.iter().map(|t| (*t).to_owned()).collect(),
-        }
-    }
-
-    #[test]
-    fn the_hub_pipeline_tag_is_the_primary_source() {
-        assert_eq!(
-            tags_from(&metadata(Some("feature-extraction"), &[])),
-            vec![ModelTag::Embedding]
-        );
-        assert_eq!(
-            tags_from(&metadata(Some("text-generation"), &[])),
-            vec![ModelTag::Text]
-        );
-        assert_eq!(
-            tags_from(&metadata(Some("image-text-to-text"), &[])),
-            vec![ModelTag::Text, ModelTag::Vision]
-        );
-        assert_eq!(
-            tags_from(&metadata(Some("text-to-image"), &[])),
-            vec![ModelTag::Image]
-        );
-        assert_eq!(
-            tags_from(&metadata(Some("text-ranking"), &[])),
-            vec![ModelTag::Rerank]
-        );
-        assert_eq!(
-            tags_from(&metadata(Some("automatic-speech-recognition"), &[])),
-            vec![ModelTag::Speech]
-        );
-    }
-
-    #[test]
-    fn tags_are_a_fallback_and_unknown_models_get_nothing() {
-        assert_eq!(
-            tags_from(&metadata(
-                None,
-                &["sentence-transformers", "sentence-similarity"]
-            )),
-            vec![ModelTag::Embedding]
-        );
-        assert!(tags_from(&metadata(None, &["region:us"])).is_empty());
-        assert!(tags_from(&metadata(Some("custom-unknown-tag"), &[])).is_empty());
-    }
-
-    struct FakeHub {
-        addr: SocketAddr,
-        hits: Arc<AtomicUsize>,
-    }
-
-    async fn hub(status: StatusCode, body: &'static str) -> FakeHub {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let counter = hits.clone();
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let counter = counter.clone();
-                tokio::spawn(async move {
-                    let service = service_fn(move |request: Request<Incoming>| {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        let path = request.uri().path().to_owned();
-                        async move {
-                            let reply =
-                                if path.ends_with("/api/models/perplexity-ai/pplx-embed-v1-0.6b") {
-                                    Response::builder()
-                                        .status(status)
-                                        .header(header::CONTENT_TYPE, "application/json")
-                                        .body(Full::new(Bytes::from(body)))
-                                } else {
-                                    Response::builder()
-                                        .status(StatusCode::UNAUTHORIZED)
-                                        .body(Full::new(Bytes::new()))
-                                };
-                            Ok::<_, Infallible>(reply.unwrap())
-                        }
-                    });
-                    let _ = http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await;
-                });
-            }
-        });
-        FakeHub { addr, hits }
-    }
-
-    fn config(endpoint: &str) -> Config {
-        let map = std::collections::HashMap::from([
-            (
-                "AGENT_RELAY_URL".to_owned(),
-                "http://127.0.0.1:8443".to_owned(),
-            ),
-            (
-                "AGENT_UPSTREAM_URL".to_owned(),
-                "http://127.0.0.1:30001".to_owned(),
-            ),
-            (
-                "AGENT_AUTH_ISSUER".to_owned(),
-                "http://127.0.0.1:9000".to_owned(),
-            ),
-            (
-                "AGENT_AUTH_CLIENT_ID".to_owned(),
-                "reverse-agent".to_owned(),
-            ),
-            ("AGENT_HF_URL".to_owned(), endpoint.to_owned()),
-        ]);
-        Config::from_env(&reverse_core::config::Env::new(move |key| {
-            map.get(key).cloned()
-        }))
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn a_known_model_is_resolved_once_and_cached() {
-        let hub = hub(
-            StatusCode::OK,
-            r#"{"pipeline_tag":"feature-extraction","tags":["feature-extraction"]}"#,
-        )
-        .await;
-        let catalog = Catalog::new(&config(&format!("http://{}", hub.addr))).unwrap();
-        let name = model("perplexity-ai/pplx-embed-v1-0.6b");
-
-        assert_eq!(
-            catalog.resolve(&name).await,
-            Some(vec![ModelTag::Embedding])
-        );
-        assert_eq!(
-            catalog.resolve(&name).await,
-            Some(vec![ModelTag::Embedding])
-        );
-        assert_eq!(hub.hits.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn an_unknown_model_is_not_refetched_within_the_backoff() {
-        let hub = hub(StatusCode::UNAUTHORIZED, "").await;
-        let catalog = Catalog::new(&config(&format!("http://{}", hub.addr))).unwrap();
-        let name = model("perplexity-ai/pplx-embed-v1-0.6b");
-
-        assert_eq!(catalog.resolve(&name).await, None);
-        assert_eq!(catalog.resolve(&name).await, None);
-        assert_eq!(hub.hits.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    #[ignore = "needs egress to huggingface.co"]
-    async fn the_real_hub_classifies_the_embedding_model() {
-        let catalog = Catalog::new(&config("https://huggingface.co")).unwrap();
-        assert_eq!(
-            catalog
-                .resolve(&model("perplexity-ai/pplx-embed-v1-0.6b"))
-                .await,
-            Some(vec![ModelTag::Embedding])
-        );
-    }
-}
+#[path = "catalog_tests.rs"]
+mod tests;

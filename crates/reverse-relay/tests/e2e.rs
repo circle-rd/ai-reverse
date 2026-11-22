@@ -26,6 +26,7 @@ async fn registers_the_served_model_and_streams_a_completion() {
         "http://relay.test/tester/v1"
     );
     assert_eq!(row["model_info"]["managed_by"], "reverse-relay");
+    assert_eq!(row["model_info"]["created_by"], "tester");
 
     let reply = send(
         stack.relay_api,
@@ -57,7 +58,7 @@ async fn registers_the_served_model_and_streams_a_completion() {
 async fn an_embedding_model_outside_the_engine_list_is_announced_and_tagged() {
     let stack = Stack::start(Options {
         extra_models: Some("perplexity-ai/pplx-embed-v1-0.6b"),
-        model_tags: Some("qwen3.8-27b=text,tools"),
+        model_tags: Some("qwen3.8-27b=text,tools;perplexity-ai/pplx-embed-v1-0.6b=embedding"),
         ..Options::default()
     })
     .await;
@@ -68,6 +69,12 @@ async fn an_embedding_model_outside_the_engine_list_is_announced_and_tagged() {
     .await;
     assert_eq!(row["model_info"]["mode"], "embedding");
     assert_eq!(row["model_info"]["tags"][0], "embedding");
+    assert_eq!(row["model_info"]["hub_owner"], "perplexity-ai");
+    assert_eq!(
+        row["model_info"]["hub_avatar_url"],
+        "https://cdn-avatars.huggingface.co/avatar.png"
+    );
+    assert_eq!(row["model_info"]["author_safety_claim"], "abliterated");
 
     let llm = eventually("the tagged LLM deployment to be registered", || async {
         stack.litellm.row("tester/qwen3.8-27b")
@@ -75,6 +82,8 @@ async fn an_embedding_model_outside_the_engine_list_is_announced_and_tagged() {
     .await;
     assert_eq!(llm["model_info"]["tags"][0], "text");
     assert_eq!(llm["model_info"]["tags"][1], "tools");
+    assert_eq!(llm["model_info"]["supports_function_calling"], true);
+    assert_eq!(llm["model_info"]["created_by"], "tester");
     stack.shutdown().await;
 }
 

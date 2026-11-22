@@ -8,16 +8,16 @@ use std::time::{Duration, Instant};
 use hyper::client::conn::http2::SendRequest;
 use reverse_core::body::ProxyBody;
 use reverse_core::ids::{ClientId, ModelName};
-use reverse_core::wire::ModelTag;
+use reverse_core::wire::ModelMetadata;
 use tokio::sync::Notify;
 
 /// A handle to send requests through one agent's tunnel.
 pub type TunnelSender = SendRequest<ProxyBody>;
 
-/// Last-seen time and tags of one `(client, model)` pair.
+/// Last-seen time and metadata of one `(client, model)` pair.
 struct Sighting {
     last: Instant,
-    tags: Vec<ModelTag>,
+    metadata: ModelMetadata,
 }
 
 /// Last-seen times of `(client, model)` pairs.
@@ -30,46 +30,47 @@ struct ModelBook {
 }
 
 impl ModelBook {
-    /// Records sightings; returns whether a pair appeared that was not wanted before.
     fn observe(
         &mut self,
         client: &ClientId,
-        models: &[(ModelName, Vec<ModelTag>)],
+        models: &[(ModelName, ModelMetadata)],
         now: Instant,
     ) -> bool {
-        let mut appeared = false;
-        for (model, tags) in models {
+        let mut changed = false;
+        for (model, metadata) in models {
             match self.seen.get_mut(&(client.clone(), model.clone())) {
                 Some(sighting) => {
                     sighting.last = now;
-                    sighting.tags.clone_from(tags);
+                    if sighting.metadata != *metadata {
+                        sighting.metadata.clone_from(metadata);
+                        changed = true;
+                    }
                 }
                 None => {
                     self.seen.insert(
                         (client.clone(), model.clone()),
                         Sighting {
                             last: now,
-                            tags: tags.clone(),
+                            metadata: metadata.clone(),
                         },
                     );
-                    appeared = true;
+                    changed = true;
                 }
             }
         }
-        appeared
+        changed
     }
 
-    /// Drops pairs older than `grace` and returns the rest with their latest tags.
     fn wanted(
         &mut self,
         grace: Duration,
         now: Instant,
-    ) -> BTreeMap<(ClientId, ModelName), Vec<ModelTag>> {
+    ) -> BTreeMap<(ClientId, ModelName), ModelMetadata> {
         self.seen
             .retain(|_, sighting| now.saturating_duration_since(sighting.last) <= grace);
         self.seen
             .iter()
-            .map(|(pair, sighting)| (pair.clone(), sighting.tags.clone()))
+            .map(|(pair, sighting)| (pair.clone(), sighting.metadata.clone()))
             .collect()
     }
 }
@@ -114,7 +115,7 @@ struct Tunnel {
     replaced: Arc<Notify>,
     node_id: String,
     inflight: Arc<AtomicUsize>,
-    models: BTreeMap<ModelName, Vec<ModelTag>>,
+    models: BTreeMap<ModelName, ModelMetadata>,
     last_used: u64,
 }
 
@@ -304,9 +305,9 @@ impl Registry {
             .collect()
     }
 
-    /// The models a connected node reported in its last poll, with their tags.
+    /// The models a connected node reported in its last poll, with their metadata.
     #[must_use]
-    pub fn node_models(&self, client: &ClientId, node_id: &str) -> Vec<(ModelName, Vec<ModelTag>)> {
+    pub fn node_models(&self, client: &ClientId, node_id: &str) -> Vec<(ModelName, ModelMetadata)> {
         self.lock()
             .tunnels
             .get(client)
@@ -314,14 +315,14 @@ impl Registry {
             .map(|t| {
                 t.models
                     .iter()
-                    .map(|(model, tags)| (model.clone(), tags.clone()))
+                    .map(|(model, metadata)| (model.clone(), metadata.clone()))
                     .collect()
             })
             .unwrap_or_default()
     }
 
     /// Records the models a connected node serves right now.
-    pub fn observe(&self, client: &ClientId, node_id: &str, models: &[(ModelName, Vec<ModelTag>)]) {
+    pub fn observe(&self, client: &ClientId, node_id: &str, models: &[(ModelName, ModelMetadata)]) {
         let mut inner = self.lock();
         let Some(tunnel) = inner
             .tunnels
@@ -331,16 +332,16 @@ impl Registry {
             return;
         };
         tunnel.models = models.iter().cloned().collect();
-        let appeared = inner.book.observe(client, models, Instant::now());
+        let changed = inner.book.observe(client, models, Instant::now());
         drop(inner);
-        if appeared {
+        if changed {
             self.changed.notify_one();
         }
     }
 
-    /// The pairs that must be registered in LiteLLM now, with their tags.
+    /// The pairs that must be registered in LiteLLM now, with their metadata.
     #[must_use]
-    pub fn wanted(&self, grace: Duration) -> BTreeMap<(ClientId, ModelName), Vec<ModelTag>> {
+    pub fn wanted(&self, grace: Duration) -> BTreeMap<(ClientId, ModelName), ModelMetadata> {
         self.lock().book.wanted(grace, Instant::now())
     }
 
@@ -353,12 +354,20 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reverse_core::wire::ModelTag;
 
     fn pair(client: &str, model: &str) -> (ClientId, ModelName) {
         (
             ClientId::parse(client).unwrap(),
             ModelName::parse(model).unwrap(),
         )
+    }
+
+    fn metadata(tags: &[ModelTag]) -> ModelMetadata {
+        ModelMetadata {
+            tags: tags.to_vec(),
+            ..ModelMetadata::default()
+        }
     }
 
     #[test]
@@ -380,7 +389,7 @@ mod tests {
         let mut book = ModelBook::default();
         let t0 = Instant::now();
         let (client, model) = pair("tester", "m1");
-        let models = vec![(model.clone(), vec![ModelTag::Text])];
+        let models = vec![(model.clone(), metadata(&[ModelTag::Text]))];
         assert!(book.observe(&client, &models, t0));
         let grace = Duration::from_secs(30);
         assert!(
@@ -395,7 +404,7 @@ mod tests {
         let mut book = ModelBook::default();
         let t0 = Instant::now();
         let (client, model) = pair("tester", "m1");
-        let models = vec![(model.clone(), vec![ModelTag::Text])];
+        let models = vec![(model.clone(), metadata(&[ModelTag::Text]))];
         assert!(book.observe(&client, &models, t0));
         assert!(!book.observe(&client, &models, t0 + Duration::from_secs(20)));
         assert_eq!(
@@ -410,7 +419,7 @@ mod tests {
         let mut book = ModelBook::default();
         let t0 = Instant::now();
         let (client, model) = pair("tester", "m1");
-        let models = vec![(model.clone(), vec![ModelTag::Text])];
+        let models = vec![(model.clone(), metadata(&[ModelTag::Text]))];
         book.observe(&client, &models, t0);
         assert!(
             book.wanted(Duration::from_secs(1), t0 + Duration::from_secs(5))
@@ -420,18 +429,43 @@ mod tests {
     }
 
     #[test]
+    fn metadata_changes_trigger_a_new_reconciliation_snapshot() {
+        let mut book = ModelBook::default();
+        let t0 = Instant::now();
+        let (client, model) = pair("tester", "m1");
+        let first = vec![(model.clone(), metadata(&[ModelTag::Text]))];
+        assert!(book.observe(&client, &first, t0));
+
+        let enriched = vec![(
+            model.clone(),
+            ModelMetadata {
+                hub_owner: Some("publisher".to_owned()),
+                hub_avatar_url: Some("https://huggingface.co/avatar.png".to_owned()),
+                ..metadata(&[ModelTag::Text])
+            },
+        )];
+        assert!(book.observe(&client, &enriched, t0 + Duration::from_secs(1)));
+        assert!(!book.observe(&client, &enriched, t0 + Duration::from_secs(2)));
+        assert_eq!(
+            book.wanted(Duration::from_secs(30), t0 + Duration::from_secs(2))
+                .get(&(client, model)),
+            Some(&enriched[0].1)
+        );
+    }
+
+    #[test]
     fn the_latest_tags_replace_earlier_ones() {
         let mut book = ModelBook::default();
         let t0 = Instant::now();
         let (client, model) = pair("tester", "m1");
-        let first = vec![(model.clone(), vec![ModelTag::Text])];
-        let second = vec![(model.clone(), vec![ModelTag::Text, ModelTag::Tools])];
+        let first = vec![(model.clone(), metadata(&[ModelTag::Text]))];
+        let second = vec![(model.clone(), metadata(&[ModelTag::Text, ModelTag::Tools]))];
         book.observe(&client, &first, t0);
         book.observe(&client, &second, t0);
         let wanted = book.wanted(Duration::from_secs(30), t0);
         assert_eq!(
             wanted.get(&(client, model)),
-            Some(&vec![ModelTag::Text, ModelTag::Tools])
+            Some(&metadata(&[ModelTag::Text, ModelTag::Tools]))
         );
     }
 }

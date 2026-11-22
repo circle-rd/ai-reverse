@@ -6,13 +6,13 @@ use std::time::{Duration, Instant};
 
 use reverse_core::ids::{ClientId, ModelName};
 use reverse_core::shutdown::triggered;
-use reverse_core::wire::ModelTag;
+use reverse_core::wire::ModelMetadata;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::error::LiteLlmError;
-use crate::litellm::{LiteLlm, Managed};
+use crate::litellm::{LiteLlm, Managed, Publish};
 use crate::registry::Registry;
 
 const FINAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -36,8 +36,8 @@ pub struct Desired {
     pub client: ClientId,
     /// Model id as the agent announced it.
     pub model: ModelName,
-    /// Capability tags to publish in the deployment's `model_info`.
-    pub tags: Vec<ModelTag>,
+    /// Model metadata to publish in the deployment's `model_info`.
+    pub metadata: ModelMetadata,
 }
 
 /// What to change in LiteLLM.
@@ -51,22 +51,34 @@ pub struct Plan {
 
 /// Diffs the wanted pairs against what LiteLLM holds.
 ///
-/// A deployment whose tags changed is replaced: LiteLLM has no partial update for
-/// `model_info`, and a stale classification is worse than one more round trip.
+/// A deployment whose tags, owner or capability flags changed is replaced: LiteLLM has no
+/// partial update for `model_info`, and a stale classification is worse than one more round
+/// trip.
 #[must_use]
-pub fn plan(wanted: &BTreeMap<(ClientId, ModelName), Vec<ModelTag>>, actual: &[Managed]) -> Plan {
-    let wanted_by_name: HashMap<String, &Vec<ModelTag>> = wanted
+pub fn plan(wanted: &BTreeMap<(ClientId, ModelName), ModelMetadata>, actual: &[Managed]) -> Plan {
+    let wanted_by_name: HashMap<String, (&ClientId, &ModelMetadata)> = wanted
         .iter()
-        .map(|((client, model), tags)| (format!("{client}/{model}"), tags))
+        .map(|((client, model), metadata)| (format!("{client}/{model}"), (client, metadata)))
         .collect();
     let mut kept = HashSet::new();
     let mut delete = Vec::new();
     for row in actual {
         let keep = match &row.reverse_name {
-            Some(name) => wanted_by_name.get(name).is_some_and(|tags| {
-                let wanted_tags: Vec<String> =
-                    tags.iter().map(|tag| tag.as_str().to_owned()).collect();
-                row.tags == wanted_tags && kept.insert(name.clone())
+            Some(name) => wanted_by_name.get(name).is_some_and(|(client, metadata)| {
+                let wanted_tags: Vec<String> = metadata
+                    .tags
+                    .iter()
+                    .map(|tag| tag.as_str().to_owned())
+                    .collect();
+                let publish = Publish::from_tags(&metadata.tags);
+                row.tags == wanted_tags
+                    && row.hub_owner.as_deref() == metadata.hub_owner.as_deref()
+                    && row.hub_avatar_url.as_deref() == metadata.hub_avatar_url.as_deref()
+                    && row.author_safety_claim == metadata.author_safety_claim
+                    && row.created_by.as_deref() == Some(client.as_str())
+                    && row.mode.as_deref() == publish.mode
+                    && row.supports == publish.supports
+                    && kept.insert(name.clone())
             }),
             None => false,
         };
@@ -77,10 +89,10 @@ pub fn plan(wanted: &BTreeMap<(ClientId, ModelName), Vec<ModelTag>>, actual: &[M
     let create = wanted
         .iter()
         .filter(|((client, model), _)| !kept.contains(&format!("{client}/{model}")))
-        .map(|((client, model), tags)| Desired {
+        .map(|((client, model), metadata)| Desired {
             client: client.clone(),
             model: model.clone(),
-            tags: tags.clone(),
+            metadata: metadata.clone(),
         })
         .collect();
     Plan { create, delete }
@@ -88,7 +100,7 @@ pub fn plan(wanted: &BTreeMap<(ClientId, ModelName), Vec<ModelTag>>, actual: &[M
 
 async fn apply(
     litellm: &LiteLlm,
-    wanted: &BTreeMap<(ClientId, ModelName), Vec<ModelTag>>,
+    wanted: &BTreeMap<(ClientId, ModelName), ModelMetadata>,
 ) -> Result<(), LiteLlmError> {
     let actual = litellm.list_managed().await?;
     let plan = plan(wanted, &actual);
@@ -130,7 +142,7 @@ async fn apply(
             let litellm = litellm.clone();
             tasks.spawn(async move {
                 let result = litellm
-                    .create(&desired.client, &desired.model, &desired.tags)
+                    .create(&desired.client, &desired.model, &desired.metadata)
                     .await;
                 (desired.client, desired.model, result)
             });
@@ -164,7 +176,7 @@ pub async fn run(
 ) {
     let mut ticker = interval(timing.interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut applied: Option<BTreeMap<(ClientId, ModelName), Vec<ModelTag>>> = None;
+    let mut applied: Option<BTreeMap<(ClientId, ModelName), ModelMetadata>> = None;
     let mut last_sync: Option<Instant> = None;
     loop {
         tokio::select! {
@@ -199,6 +211,8 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::litellm::Supports;
+    use reverse_core::wire::{AuthorSafetyClaim, ModelTag};
 
     fn pair(client: &str, model: &str) -> (ClientId, ModelName) {
         (
@@ -209,18 +223,45 @@ mod tests {
 
     fn wanted(
         entries: &[(&str, &str, &[ModelTag])],
-    ) -> BTreeMap<(ClientId, ModelName), Vec<ModelTag>> {
+    ) -> BTreeMap<(ClientId, ModelName), ModelMetadata> {
         entries
             .iter()
-            .map(|(client, model, tags)| (pair(client, model), tags.to_vec()))
+            .map(|(client, model, tags)| {
+                (
+                    pair(client, model),
+                    ModelMetadata {
+                        tags: tags.to_vec(),
+                        ..ModelMetadata::default()
+                    },
+                )
+            })
             .collect()
     }
 
     fn row(id: &str, name: Option<&str>, tags: &[&str]) -> Managed {
+        let parsed: Vec<ModelTag> = tags.iter().filter_map(|tag| ModelTag::parse(tag)).collect();
+        let publish = Publish::from_tags(&parsed);
         Managed {
             id: id.to_owned(),
             reverse_name: name.map(str::to_owned),
+            created_by: name
+                .and_then(|name| name.split_once('/'))
+                .map(|(owner, _)| owner.to_owned()),
             tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            hub_owner: None,
+            hub_avatar_url: None,
+            author_safety_claim: None,
+            mode: publish.mode.map(str::to_owned),
+            supports: publish.supports,
+        }
+    }
+
+    fn legacy_row(id: &str, name: &str, tags: &[&str]) -> Managed {
+        Managed {
+            created_by: None,
+            mode: None,
+            supports: Supports::default(),
+            ..row(id, Some(name), tags)
         }
     }
 
@@ -234,7 +275,10 @@ mod tests {
             vec![Desired {
                 client: ClientId::parse("tester").unwrap(),
                 model: ModelName::parse("new").unwrap(),
-                tags: vec![ModelTag::Text],
+                metadata: ModelMetadata {
+                    tags: vec![ModelTag::Text],
+                    ..ModelMetadata::default()
+                },
             }]
         );
         assert_eq!(plan.delete, vec!["1".to_owned()]);
@@ -254,7 +298,42 @@ mod tests {
         let plan = plan(&wanted, &actual);
         assert_eq!(plan.delete, vec!["1".to_owned()]);
         assert_eq!(plan.create.len(), 1);
-        assert_eq!(plan.create[0].tags, vec![ModelTag::Text, ModelTag::Tools]);
+        assert_eq!(
+            plan.create[0].metadata.tags,
+            vec![ModelTag::Text, ModelTag::Tools]
+        );
+    }
+
+    #[test]
+    fn replaces_a_deployment_when_hub_display_metadata_changes() {
+        let client = ClientId::parse("tester").unwrap();
+        let model = ModelName::parse("Org/model").unwrap();
+        let metadata = ModelMetadata {
+            tags: vec![ModelTag::Text],
+            hub_owner: Some("Org".to_owned()),
+            hub_avatar_url: Some("https://cdn-avatars.huggingface.co/avatar.png".to_owned()),
+            author_safety_claim: Some(AuthorSafetyClaim::Abliterated),
+        };
+        let wanted = BTreeMap::from([((client.clone(), model.clone()), metadata.clone())]);
+        let mut actual = row("1", Some("tester/Org/model"), &["text"]);
+        actual.hub_owner = metadata.hub_owner.clone();
+        actual.hub_avatar_url = metadata.hub_avatar_url.clone();
+        actual.author_safety_claim = metadata.author_safety_claim;
+        assert_eq!(plan(&wanted, &[actual.clone()]), Plan::default());
+
+        actual.author_safety_claim = None;
+        let plan = plan(&wanted, &[actual]);
+        assert_eq!(plan.delete, vec!["1".to_owned()]);
+        assert_eq!(plan.create[0].metadata, metadata);
+    }
+
+    #[test]
+    fn replaces_a_deployment_missing_the_owner_or_capability_flags() {
+        let wanted = wanted(&[("tester", "m", &[ModelTag::Text, ModelTag::Tools])]);
+        let actual = [legacy_row("1", "tester/m", &["text", "tools"])];
+        let plan = plan(&wanted, &actual);
+        assert_eq!(plan.delete, vec!["1".to_owned()]);
+        assert_eq!(plan.create.len(), 1);
     }
 
     #[test]
