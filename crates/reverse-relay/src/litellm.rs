@@ -54,16 +54,26 @@ pub(crate) struct Publish {
 impl Publish {
     pub(crate) fn from_tags(tags: &[ModelTag]) -> Self {
         let has = |tag| tags.contains(&tag);
-        // Only embedding has a distinct routing mode on the routes the relay serves;
-        // image and rerank models are still tagged but stay on the chat surface.
-        let mode = has(ModelTag::Embedding).then_some("embedding");
+        // LiteLLM's mode names the endpoint family a deployment serves. One speech lane answers
+        // both recognition and synthesis, so it keeps the chat surface and its audio flags.
+        let mode = if has(ModelTag::Embedding) {
+            Some("embedding")
+        } else if has(ModelTag::Image) {
+            Some("image_generation")
+        } else if has(ModelTag::Transcription) {
+            Some("audio_transcription")
+        } else if has(ModelTag::Video) {
+            Some("video_generation")
+        } else {
+            None
+        };
         Self {
             mode,
             supports: Supports {
                 function_calling: has(ModelTag::Tools),
                 vision: has(ModelTag::Vision),
                 video_input: has(ModelTag::Video),
-                audio_input: has(ModelTag::Speech),
+                audio_input: has(ModelTag::Speech) || has(ModelTag::Transcription),
                 audio_output: has(ModelTag::Speech),
             },
         }
@@ -333,5 +343,43 @@ mod tests {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+
+    #[test]
+    fn each_media_tag_names_its_litellm_endpoint_family() {
+        assert_eq!(
+            Publish::from_tags(&[ModelTag::Embedding]).mode,
+            Some("embedding")
+        );
+        assert_eq!(
+            Publish::from_tags(&[ModelTag::Image]).mode,
+            Some("image_generation")
+        );
+        assert_eq!(
+            Publish::from_tags(&[ModelTag::Transcription]).mode,
+            Some("audio_transcription")
+        );
+        assert_eq!(
+            Publish::from_tags(&[ModelTag::Video]).mode,
+            Some("video_generation")
+        );
+        assert_eq!(
+            Publish::from_tags(&[ModelTag::Text, ModelTag::Tools]).mode,
+            None
+        );
+    }
+
+    #[test]
+    fn a_speech_model_keeps_the_chat_surface_and_its_audio_flags() {
+        let speech = Publish::from_tags(&[ModelTag::Speech]);
+        assert_eq!(speech.mode, None);
+        assert!(speech.supports.audio_input && speech.supports.audio_output);
+        let asr = Publish::from_tags(&[ModelTag::Transcription]);
+        assert!(asr.supports.audio_input && !asr.supports.audio_output);
     }
 }

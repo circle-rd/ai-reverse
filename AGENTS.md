@@ -382,8 +382,8 @@ private helpers.
   attempts are counted per client address in bounded state, locked out with a
   `Retry-After` after a threshold, with lockouts doubling and expiring.
 - Tunnels are capped globally and per account; both answer `429`.
-- Only the routes allowlisted in `reverse_core::forward` cross the tunnel;
-  queries are never forwarded; only `content-type`, `content-length`, `accept`
+- Only the routes allowlisted in `reverse_core::forward` cross the tunnel (chat, embeddings,
+  images, audio and the OpenAI videos surface as LiteLLM proxies it); queries are never forwarded; only `content-type`, `content-length`, `accept`
   and `x-request-id` request headers are forwarded.
 - The caller's `Authorization` and `Cookie` are never forwarded; the engine key
   is added by the agent and never leaves it.

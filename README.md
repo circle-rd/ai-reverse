@@ -58,8 +58,10 @@ flowchart LR
 - Tunnels are capped globally (`RELAY_MAX_TUNNELS`) and per account
   (`RELAY_MAX_TUNNELS_PER_USER`); both answer `429` without touching the agent.
 - Only the allowlisted OpenAI routes cross the tunnel (`GET /v1/models`,
-  `POST /v1/{chat/completions,completions,embeddings,embedding,responses,messages}`);
-  queries are never forwarded.
+  `POST /v1/{chat/completions,completions,embeddings,embedding,responses,messages,images/generations,audio/transcriptions,audio/speech}`,
+  and the OpenAI videos surface as LiteLLM proxies it: `/v1/videos`, its `{id}`,
+  `{id}/content` and `{id}/remix`, `edits`, `extensions` and `characters`);
+  realtime websockets and queries are never forwarded.
 - Caller credentials are never forwarded to the engine and the engine key is
   never sent to the relay; the agent injects the engine key itself.
 - The engine key and the agent credential are held in `SecretString` and never
