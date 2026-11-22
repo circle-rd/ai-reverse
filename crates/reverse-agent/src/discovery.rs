@@ -9,7 +9,7 @@ use http_body_util::{BodyExt, Limited};
 use reverse_core::body::empty;
 use reverse_core::ids::ModelName;
 use reverse_core::shutdown::triggered;
-use reverse_core::wire::{ModelEntry, ModelTag, ModelsSnapshot};
+use reverse_core::wire::{ModelEntry, ModelMetadata, ModelTag, ModelsSnapshot};
 use serde::Deserialize;
 use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior, interval};
@@ -71,7 +71,7 @@ pub async fn run(
 ) {
     let mut ticker = interval(every);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut resolved: BTreeMap<ModelName, Vec<ModelTag>> = BTreeMap::new();
+    let mut resolved: BTreeMap<ModelName, ModelMetadata> = BTreeMap::new();
     let mut unknown = HashSet::new();
     loop {
         tokio::select! {
@@ -111,31 +111,32 @@ async fn resolve_pass(
     hints: &BTreeMap<ModelName, Vec<ModelTag>>,
     declared: &Declared,
     catalog: Option<&Catalog>,
-    settled: &BTreeMap<ModelName, Vec<ModelTag>>,
+    settled: &BTreeMap<ModelName, ModelMetadata>,
     unknown: &mut HashSet<ModelName>,
     budget: Duration,
-) -> BTreeMap<ModelName, Vec<ModelTag>> {
+) -> BTreeMap<ModelName, ModelMetadata> {
     let mut fresh = BTreeMap::new();
     let mut pending = BTreeSet::new();
     pending.extend(ids.iter().filter_map(|id| ModelName::parse(id).ok()));
     pending.extend(declared.extras.iter().cloned());
     let deadline = Instant::now() + budget;
     for name in pending {
-        if declared.tags.contains_key(&name)
-            || settled.contains_key(&name)
-            || fresh.contains_key(&name)
-        {
+        if settled.contains_key(&name) || fresh.contains_key(&name) {
             continue;
         }
-        let has_hints = hints.get(&name).is_some_and(|tags| !tags.is_empty());
+        if catalog.is_none() && declared.tags.contains_key(&name) {
+            continue;
+        }
+        let has_hints = hints.get(&name).is_some_and(|tags| !tags.is_empty())
+            || declared.tags.contains_key(&name);
         if Instant::now() >= deadline {
             tracing::debug!("catalog.pass_budget_exhausted");
             break;
         }
         match catalog {
             Some(catalog) => match catalog.resolve(&name).await {
-                Some(tags) => {
-                    fresh.insert(name, tags);
+                Some(metadata) => {
+                    fresh.insert(name, metadata);
                 }
                 None => {
                     if !has_hints && unknown.insert(name.clone()) {
@@ -251,7 +252,7 @@ fn publish(
     snapshots: &watch::Sender<ModelsSnapshot>,
     outcome: Result<EngineList, DiscoveryError>,
     declared: &Declared,
-    resolved: &BTreeMap<ModelName, Vec<ModelTag>>,
+    resolved: &BTreeMap<ModelName, ModelMetadata>,
 ) {
     let (available, models, rejected) = match outcome {
         Ok(engine) => {
@@ -287,7 +288,7 @@ fn assemble(
     ids: Vec<String>,
     hints: &BTreeMap<ModelName, Vec<ModelTag>>,
     declared: &Declared,
-    resolved: &BTreeMap<ModelName, Vec<ModelTag>>,
+    resolved: &BTreeMap<ModelName, ModelMetadata>,
 ) -> (Vec<ModelEntry>, Vec<String>) {
     let mut announced = BTreeMap::<ModelName, ()>::new();
     let mut rejected = Vec::new();
@@ -305,12 +306,13 @@ fn assemble(
     let models = announced
         .into_keys()
         .map(|name| {
+            let hub = resolved.get(&name);
             let mut tags = match declared.tags.get(&name) {
                 Some(declared) => declared.clone(),
                 None => {
                     let mut merged = hints.get(&name).cloned().unwrap_or_default();
-                    if let Some(hub) = resolved.get(&name) {
-                        merged.extend(hub.iter().copied());
+                    if let Some(hub) = hub {
+                        merged.extend(hub.tags.iter().copied());
                     }
                     merged
                 }
@@ -319,7 +321,12 @@ fn assemble(
             tags.dedup();
             ModelEntry {
                 id: name.as_str().to_owned(),
-                tags,
+                metadata: ModelMetadata {
+                    tags,
+                    hub_owner: hub.and_then(|metadata| metadata.hub_owner.clone()),
+                    hub_avatar_url: hub.and_then(|metadata| metadata.hub_avatar_url.clone()),
+                    author_safety_claim: hub.and_then(|metadata| metadata.author_safety_claim),
+                },
             }
         })
         .collect();
@@ -329,6 +336,7 @@ fn assemble(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reverse_core::wire::AuthorSafetyClaim;
 
     fn model(name: &str) -> ModelName {
         ModelName::parse(name).unwrap()
@@ -345,7 +353,10 @@ mod tests {
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
         assert_eq!(bad, ["/models/x.gguf"]);
-        assert!(models[0].tags.is_empty(), "unknown models carry no guess");
+        assert!(
+            models[0].metadata.tags.is_empty(),
+            "unknown models carry no guess"
+        );
     }
 
     #[test]
@@ -360,9 +371,20 @@ mod tests {
         let resolved = BTreeMap::from([
             (
                 model("perplexity-ai/pplx-embed-v1-0.6b"),
-                vec![ModelTag::Embedding],
+                ModelMetadata {
+                    tags: vec![ModelTag::Embedding],
+                    ..ModelMetadata::default()
+                },
             ),
-            (model("qwen3.8-flash-next"), vec![ModelTag::Text]),
+            (
+                model("qwen3.8-flash-next"),
+                ModelMetadata {
+                    tags: vec![ModelTag::Text],
+                    hub_owner: Some("qwen".to_owned()),
+                    hub_avatar_url: Some("https://huggingface.co/avatar.png".to_owned()),
+                    author_safety_claim: Some(AuthorSafetyClaim::Abliterated),
+                },
+            ),
         ]);
         let (models, rejected) = assemble(
             vec!["qwen3.8-flash-next".into()],
@@ -373,20 +395,38 @@ mod tests {
         assert!(rejected.is_empty());
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "perplexity-ai/pplx-embed-v1-0.6b");
-        assert_eq!(models[0].tags, vec![ModelTag::Embedding]);
+        assert_eq!(models[0].metadata.tags, vec![ModelTag::Embedding]);
         assert_eq!(models[1].id, "qwen3.8-flash-next");
-        assert_eq!(models[1].tags, vec![ModelTag::Text, ModelTag::Tools]);
+        assert_eq!(
+            models[1].metadata.tags,
+            vec![ModelTag::Text, ModelTag::Tools]
+        );
+        assert_eq!(models[1].metadata.hub_owner.as_deref(), Some("qwen"));
+        assert_eq!(
+            models[1].metadata.hub_avatar_url.as_deref(),
+            Some("https://huggingface.co/avatar.png")
+        );
+        assert_eq!(
+            models[1].metadata.author_safety_claim,
+            Some(AuthorSafetyClaim::Abliterated)
+        );
     }
 
     #[test]
     fn engine_hints_are_merged_with_hub_metadata() {
         let hints = BTreeMap::from([(model("m"), vec![ModelTag::Tools])]);
-        let resolved = BTreeMap::from([(model("m"), vec![ModelTag::Text, ModelTag::Vision])]);
+        let resolved = BTreeMap::from([(
+            model("m"),
+            ModelMetadata {
+                tags: vec![ModelTag::Text, ModelTag::Vision],
+                ..ModelMetadata::default()
+            },
+        )]);
         let (models, rejected) =
             assemble(vec!["m".into()], &hints, &Declared::default(), &resolved);
         assert!(rejected.is_empty());
         assert_eq!(
-            models[0].tags,
+            models[0].metadata.tags,
             vec![ModelTag::Text, ModelTag::Tools, ModelTag::Vision]
         );
     }

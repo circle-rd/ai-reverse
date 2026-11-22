@@ -25,7 +25,7 @@ flowchart LR
     engine -->|"http + engine key"| agent
   end
 
-  hub["Hugging Face API<br/>pipeline_tag"]
+  hub["Hugging Face API<br/>model tags · owner avatar"]
   auth["AuthService<br/>OIDC · JWKS · device flow"]
   browser["Browser"]
 
@@ -79,10 +79,10 @@ flowchart LR
   `tunnel:serve` scope and the relay URL as its resource.
 - A local OpenAI-compatible engine bound to `127.0.0.1` (or another
   loopback address); TLS to the engine is intentionally unsupported.
-- Optional egress for model classification: with the default
-  `AGENT_HF_METADATA=true` by default, model ids are sent to the Hugging Face
-  API over HTTPS (`AGENT_HF_URL`). Set it to `false` to keep model ids on the box;
-  `HTTPS_PROXY`/`NO_PROXY` are honored for this lookup.
+- Optional egress for model enrichment: with `AGENT_HF_METADATA=true` (the
+  default), model ids are sent to the Hugging Face API over HTTPS
+  (`AGENT_HF_URL`) for tags and public owner metadata. Set it to `false` to
+  keep model ids on the box; `HTTPS_PROXY`/`NO_PROXY` are honored for this lookup.
 
 ## Quickstart (container)
 
@@ -159,10 +159,10 @@ Required settings have no silent defaults. Supplying both `KEY` and
 | `AGENT_INSECURE_TRANSPORT` | no | Allow plain HTTP to a non-loopback relay. Default `false`. |
 | `AGENT_EXTRA_MODELS` | no | Comma-separated ids announced in addition to the engine's `/v1/models`. |
 | `AGENT_MODEL_TAGS` | no | `model=tag[,tag][;…]`; overrides hub metadata for the named models. |
-| `AGENT_HF_METADATA` | no | `true`/`false`: consult the hub to classify models. Default `true`. |
+| `AGENT_HF_METADATA` | no | `true`/`false`: consult the hub for model capabilities, author claims and public owner avatars. Default `true`. |
 | `AGENT_HF_URL` | no | Hub origin; `https` unless loopback. Default `https://huggingface.co`. |
 | `AGENT_HF_TOKEN` | no | Token for gated or private hub repositories. |
-| `AGENT_HF_TIMEOUT_SECS` | no | Bound on one metadata lookup. Default 5. |
+| `AGENT_HF_TIMEOUT_SECS` | no | Bound on each Hub request. Default 5. |
 
 `*` Exactly one of the direct and `_FILE` forms is required when the secret is
 set. Secrets are never echoed in errors or logs.
@@ -222,13 +222,23 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
   `embedding`, `text-generation` → `text`, `image-text-to-text` → `text` +
   `vision`, `text-to-image` → `image`, `automatic-speech-recognition` →
   `speech`, and `text-ranking` → `rerank`. Results are cached; unknown or
-  unreachable models are re-checked after 15 minutes. One bounded
-  classification pass runs per poll cycle (`AGENT_HF_TIMEOUT_SECS`), so a slow
-  hub can never postpone the announcement of newly discovered models: they are
-  announced first, then enriched.
-- **Override.** `AGENT_MODEL_TAGS` wins over the engine and the hub, for
-  internal ids neither knows and for facts they do not record, like tool
-  calling:
+  unreachable models are re-checked after 15 minutes. One bounded enrichment
+  pass runs per poll cycle (`AGENT_HF_TIMEOUT_SECS`), so a slow hub can never
+  postpone the announcement of newly discovered models: they are announced
+  first, then enriched.
+- **Owner image.** For `namespace/model` ids found on the hub, the agent records
+  the namespace as `hub_owner` and looks up its public user or organization
+  profile. The public `avatarUrl` is accepted only over HTTPS from the configured
+  Hub domain or Hugging Face; avatar results are cached per namespace. The owner
+  is the repository namespace, not necessarily the original model publisher or
+  inference provider.
+- **Author safety claims.** Exact Hub tags `uncensored` and `abliterated` are
+  exposed as `model_info.author_safety_claim` (`uncensored`, `abliterated`, or
+  `uncensored-and-abliterated`). These are author-declared labels, not a safety
+  evaluation; absent tags remain unknown, and names are never used to guess.
+- **Override.** `AGENT_MODEL_TAGS` supplies capability tags for ids unknown to
+  the engine and hub, and corrects known ids for facts they do not report, like
+  tool calling:
 
   ```bash
   AGENT_EXTRA_MODELS=perplexity-ai/pplx-embed-v1-0.6b
@@ -237,21 +247,22 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
 
 - A model with no source and no operator declaration carries **no** tags; the
   agent logs `models.tags_unknown` instead of guessing.
-- The relay publishes the tags in `model_info.tags` and maps them to LiteLLM's
-  capability fields: `tools` → `supports_function_calling`, `vision` →
-  `supports_vision`, `video` → `supports_video_input`, `speech` →
-  `supports_audio_input` + `supports_audio_output`, and `embedding` →
-  `model_info.mode = "embedding"`. A flag is only set when its tag is present,
-  so an unclassified model is never asserted to lack a capability. Image and
-  rerank models keep their tag but stay on the chat surface: the relay does not
-  serve their dedicated routes.
+- The relay publishes tags in `model_info.tags`, owner data in
+  `model_info.hub_owner` and `model_info.hub_avatar_url`, and author claims in
+  `model_info.author_safety_claim`. It maps capability tags to LiteLLM fields:
+  `tools` → `supports_function_calling`, `vision` → `supports_vision`, `video` →
+  `supports_video_input`, `speech` → `supports_audio_input` +
+  `supports_audio_output`, and `embedding` → `model_info.mode = "embedding"`. A
+  flag is only set when its tag is present, so an unclassified model is never
+  asserted to lack a capability. Image and rerank models keep their tag but stay
+  on the chat surface: the relay does not serve their dedicated routes.
 - Each deployment carries `model_info.managed_by = "reverse-relay"` and
   `model_info.created_by = "{account}"`, in addition to `client_id` and
   `reverse_name`. This distinguishes models learned by the relay from models
   configured directly in LiteLLM, even when both have the same owner.
-- Changing tags, owner or capability flags replaces the deployment on the next
-  reconcile: LiteLLM has no partial `model_info` update, so the old row is
-  deleted and recreated with the new classification.
+- Changing tags, owner, avatar, author claim or capability flags replaces the
+  deployment on the next reconcile: LiteLLM has no partial `model_info` update,
+  so the old row is deleted and recreated with the new metadata.
 - The relay registers one deployment per `{account}/{model}` alias. Several
   agents of the same account that announce the same model id share that alias
   and are load-balanced by the relay; the deployment stays while at least one
@@ -261,8 +272,9 @@ Tags: `text`, `tools`, `vision`, `image`, `video`, `speech`, `embedding`,
 `rerank`.
 
 Classification is enrichment, never a serving dependency: a failed lookup or an
-air-gapped box degrades the tags only. With `AGENT_HF_METADATA=false` the agent
-never contacts the hub, so model ids stay on the box.
+air-gapped box degrades the tags and optional display metadata only. With
+`AGENT_HF_METADATA=false` the agent never contacts the hub, so model ids stay on
+the box.
 
 ## Container images
 

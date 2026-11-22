@@ -142,14 +142,33 @@ impl ModelTag {
     }
 }
 
-/// One model the agent announces to the relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthorSafetyClaim {
+    Uncensored,
+    Abliterated,
+    UncensoredAndAbliterated,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMetadata {
+    #[serde(default)]
+    pub tags: Vec<ModelTag>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_avatar_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_safety_claim: Option<AuthorSafetyClaim>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelEntry {
-    /// Model id exactly as the engine (or the operator) reports it.
     pub id: String,
-    /// Capability tags, sorted and deduplicated.
-    pub tags: Vec<ModelTag>,
+    #[serde(flatten)]
+    pub metadata: ModelMetadata,
 }
 
 /// What the inference engine serves right now, as seen by the agent.
@@ -193,7 +212,10 @@ mod tests {
     fn a_model_entry_carries_kebab_case_tags() {
         let entry = ModelEntry {
             id: "perplexity-ai/pplx-embed-v1-0.6b".to_owned(),
-            tags: vec![ModelTag::Embedding],
+            metadata: ModelMetadata {
+                tags: vec![ModelTag::Embedding],
+                ..ModelMetadata::default()
+            },
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert_eq!(
@@ -201,6 +223,40 @@ mod tests {
             r#"{"id":"perplexity-ai/pplx-embed-v1-0.6b","tags":["embedding"]}"#
         );
         assert_eq!(serde_json::from_str::<ModelEntry>(&json).unwrap(), entry);
+        assert_eq!(
+            serde_json::from_str::<ModelEntry>(r#"{"id":"legacy/model","tags":[]}"#).unwrap(),
+            ModelEntry {
+                id: "legacy/model".to_owned(),
+                metadata: ModelMetadata::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn model_metadata_uses_camel_case_and_kebab_case_claims() {
+        let entry = ModelEntry {
+            id: "owner/model".to_owned(),
+            metadata: ModelMetadata {
+                tags: vec![],
+                hub_owner: Some("owner".to_owned()),
+                hub_avatar_url: Some("https://huggingface.co/avatar.png".to_owned()),
+                author_safety_claim: Some(AuthorSafetyClaim::UncensoredAndAbliterated),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&entry).unwrap(),
+            serde_json::json!({
+                "id": "owner/model",
+                "tags": [],
+                "hubOwner": "owner",
+                "hubAvatarUrl": "https://huggingface.co/avatar.png",
+                "authorSafetyClaim": "uncensored-and-abliterated"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ModelEntry>(serde_json::to_value(&entry).unwrap()).unwrap(),
+            entry
+        );
     }
 
     #[test]

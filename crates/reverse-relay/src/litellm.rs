@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use reqwest::{Client, Method, RequestBuilder, Url, redirect};
 use reverse_core::ids::{ClientId, ModelName};
 use reverse_core::secret::SecretString;
-use reverse_core::wire::ModelTag;
+use reverse_core::wire::{AuthorSafetyClaim, ModelMetadata, ModelTag};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -25,6 +25,9 @@ pub struct Managed {
     pub created_by: Option<String>,
     /// Capability tags recorded in `model_info`, as sent.
     pub tags: Vec<String>,
+    pub hub_owner: Option<String>,
+    pub hub_avatar_url: Option<String>,
+    pub author_safety_claim: Option<AuthorSafetyClaim>,
     /// Routing mode recorded in `model_info`.
     pub mode: Option<String>,
     /// Capability flags recorded in `model_info`.
@@ -92,6 +95,12 @@ struct RowInfo {
     mode: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    hub_owner: Option<String>,
+    #[serde(default)]
+    hub_avatar_url: Option<String>,
+    #[serde(default)]
+    author_safety_claim: Option<AuthorSafetyClaim>,
     #[serde(default, deserialize_with = "null_to_false")]
     supports_function_calling: bool,
     #[serde(default, deserialize_with = "null_to_false")]
@@ -125,6 +134,12 @@ struct NewModelInfo<'a> {
     created_by: &'a str,
     reverse_name: String,
     tags: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hub_owner: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hub_avatar_url: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    author_safety_claim: Option<AuthorSafetyClaim>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,6 +225,9 @@ impl LiteLlm {
                     reverse_name: info.reverse_name,
                     created_by: info.created_by,
                     tags: info.tags,
+                    hub_owner: info.hub_owner,
+                    hub_avatar_url: info.hub_avatar_url,
+                    author_safety_claim: info.author_safety_claim,
                     mode: info.mode,
                     supports: Supports {
                         function_calling: info.supports_function_calling,
@@ -228,10 +246,10 @@ impl LiteLlm {
         &self,
         client: &ClientId,
         model: &ModelName,
-        tags: &[ModelTag],
+        metadata: &ModelMetadata,
     ) -> Result<(), LiteLlmError> {
         let name = format!("{client}/{model}");
-        let publish = Publish::from_tags(tags);
+        let publish = Publish::from_tags(&metadata.tags);
         let body = NewModel {
             model_name: name.clone(),
             litellm_params: LiteLlmParams {
@@ -244,7 +262,10 @@ impl LiteLlm {
                 client_id: client.as_str(),
                 created_by: client.as_str(),
                 reverse_name: name,
-                tags: tags.iter().map(|tag| tag.as_str()).collect(),
+                tags: metadata.tags.iter().map(|tag| tag.as_str()).collect(),
+                hub_owner: metadata.hub_owner.as_deref(),
+                hub_avatar_url: metadata.hub_avatar_url.as_deref(),
+                author_safety_claim: metadata.author_safety_claim,
                 mode: publish.mode,
                 supports_function_calling: publish.supports.function_calling.then_some(true),
                 supports_vision: publish.supports.vision.then_some(true),
@@ -298,6 +319,9 @@ mod tests {
                     reverse_name: info.reverse_name.clone(),
                     created_by: info.created_by.clone(),
                     tags: info.tags.clone(),
+                    hub_owner: info.hub_owner.clone(),
+                    hub_avatar_url: info.hub_avatar_url.clone(),
+                    author_safety_claim: info.author_safety_claim,
                     mode: info.mode.clone(),
                     supports: Supports {
                         function_calling: info.supports_function_calling,

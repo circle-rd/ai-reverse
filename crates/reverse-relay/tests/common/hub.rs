@@ -25,11 +25,19 @@ impl FakeHub {
             listener,
             |request: Request<Incoming>| async move {
                 let path = request.uri().path().to_owned();
-                let reply = if path.ends_with("pplx-embed-v1-0.6b") {
+                let reply = if path.ends_with("/users/perplexity-ai/overview") {
+                    text(StatusCode::NOT_FOUND, "application/json", "{}")
+                } else if path.ends_with("/organizations/perplexity-ai/overview") {
                     text(
                         StatusCode::OK,
                         "application/json",
-                        r#"{"pipeline_tag":"feature-extraction","tags":["feature-extraction"]}"#,
+                        r#"{"avatarUrl":"https://cdn-avatars.huggingface.co/avatar.png"}"#,
+                    )
+                } else if path.ends_with("pplx-embed-v1-0.6b") {
+                    text(
+                        StatusCode::OK,
+                        "application/json",
+                        r#"{"pipeline_tag":"feature-extraction","tags":["feature-extraction","abliterated"]}"#,
                     )
                 } else {
                     text(StatusCode::UNAUTHORIZED, "application/json", "{}")

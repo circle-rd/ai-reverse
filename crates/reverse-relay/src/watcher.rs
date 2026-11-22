@@ -8,7 +8,7 @@ use http_body_util::{BodyExt, Limited};
 use reverse_core::body::empty;
 use reverse_core::ids::{ClientId, ModelName};
 use reverse_core::wire::{
-    AGENT_INFO_PATH, AGENT_MODELS_PATH, AgentInfo, ModelTag, ModelsSnapshot, TUNNEL_AUTHORITY,
+    AGENT_INFO_PATH, AGENT_MODELS_PATH, AgentInfo, ModelMetadata, ModelsSnapshot, TUNNEL_AUTHORITY,
 };
 use serde::de::DeserializeOwned;
 use tokio::time::{MissedTickBehavior, interval};
@@ -60,13 +60,13 @@ pub async fn fetch_info(
 async fn poll(
     sender: &mut TunnelSender,
     limit: Duration,
-) -> Result<Vec<(ModelName, Vec<ModelTag>)>, PollError> {
+) -> Result<Vec<(ModelName, ModelMetadata)>, PollError> {
     let snapshot: ModelsSnapshot = get_json(sender, AGENT_MODELS_PATH, limit).await?;
     Ok(snapshot
         .models
         .iter()
         .filter_map(|entry| match ModelName::parse(&entry.id) {
-            Ok(name) => Some((name, entry.tags.clone())),
+            Ok(name) => Some((name, entry.metadata.clone())),
             Err(error) => {
                 tracing::debug!(%error, "models.name_rejected");
                 None
