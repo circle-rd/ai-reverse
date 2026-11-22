@@ -62,38 +62,11 @@ pub async fn run(config: Arc<Config>, state: Arc<AgentState>, mut shutdown: watc
         if session.agent_id().is_none() && !session.enroll(&mut shutdown).await {
             return;
         }
-        let Some(access) = session.access(&mut shutdown).await else {
-            session.forget();
-            continue;
-        };
-        let Some(agent_id) = session.agent_id() else {
-            continue;
-        };
-
         let started = Instant::now();
-        let dialed = tokio::select! {
-            result = dial(&config, tls.as_ref(), &access, &agent_id) => result,
-            () = triggered(&mut shutdown) => return,
-        };
-        match dialed {
-            Ok(upgraded) => {
-                tracing::info!(
-                    relay = %config.relay.authority(),
-                    agent_id = %agent_id,
-                    "tunnel.connected"
-                );
-                match serve(upgraded, state.clone(), shutdown.clone()).await {
-                    Ok(()) => tracing::info!("tunnel.closed"),
-                    Err(error) => tracing::warn!(%error, "tunnel.failed"),
-                }
-            }
-            Err(TunnelError::Refused(StatusCode::UNAUTHORIZED)) => {
-                tracing::warn!("credential.rejected");
-                if session.renew(&mut shutdown).await.is_none() {
-                    session.forget();
-                }
-            }
-            Err(error) => tracing::warn!(%error, "tunnel.dial_failed"),
+        match attempt(&config, tls.as_ref(), &mut session, &state, &mut shutdown).await {
+            Attempt::Stopped => return,
+            Attempt::Forgotten => continue,
+            Attempt::Failed => {}
         }
         if *shutdown.borrow() {
             return;
@@ -107,6 +80,63 @@ pub async fn run(config: Arc<Config>, state: Arc<AgentState>, mut shutdown: watc
         }
         delay = (delay * 2).min(config.reconnect_max);
     }
+}
+
+/// What one pass of the connection loop ended with.
+enum Attempt {
+    /// Shutdown was requested while connecting.
+    Stopped,
+    /// The saved credential was refused and forgotten; enrolment runs on the next pass.
+    Forgotten,
+    /// The pass failed or its tunnel ended; back off before the next one.
+    Failed,
+}
+
+async fn attempt(
+    config: &Config,
+    tls: Option<&TlsConnector>,
+    session: &mut auth::Session,
+    state: &Arc<AgentState>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Attempt {
+    let access = match session.access(shutdown).await {
+        auth::Access::Token(access) => access,
+        auth::Access::Rejected => {
+            tracing::warn!("credential.rejected");
+            session.forget();
+            return Attempt::Forgotten;
+        }
+        auth::Access::Unavailable => return Attempt::Failed,
+    };
+    let Some(agent_id) = session.agent_id() else {
+        return Attempt::Failed;
+    };
+    let dialed = tokio::select! {
+        result = dial(config, tls, &access, &agent_id) => result,
+        () = triggered(shutdown) => return Attempt::Stopped,
+    };
+    match dialed {
+        Ok(upgraded) => {
+            tracing::info!(
+                relay = %config.relay.authority(),
+                agent_id = %agent_id,
+                "tunnel.connected"
+            );
+            match serve(upgraded, state.clone(), shutdown.clone()).await {
+                Ok(()) => tracing::info!("tunnel.closed"),
+                Err(error) => tracing::warn!(%error, "tunnel.failed"),
+            }
+        }
+        Err(TunnelError::Refused(StatusCode::UNAUTHORIZED)) => {
+            tracing::warn!("credential.rejected_by_relay");
+            if let auth::Access::Rejected = session.renew(shutdown).await {
+                session.forget();
+                return Attempt::Forgotten;
+            }
+        }
+        Err(error) => tracing::warn!(%error, "tunnel.dial_failed"),
+    }
+    Attempt::Failed
 }
 
 async fn bounded<T, E>(

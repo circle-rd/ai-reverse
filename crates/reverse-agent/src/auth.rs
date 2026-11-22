@@ -1,8 +1,9 @@
 //! Device authorization against the identity provider and renewal of the access token.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use reqwest::StatusCode;
 use reverse_core::ids::{AGENT_ID_LEN, AgentId};
 use reverse_core::secret::SecretString;
 use reverse_core::shutdown::triggered;
@@ -15,6 +16,8 @@ use crate::credential::{self, Credential};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const SLOW_DOWN_STEP: u64 = 5;
+const SAVE_ATTEMPTS: u32 = 3;
+const SAVE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Why an authorization attempt ended without an access token.
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +40,16 @@ enum AuthError {
     Save(#[from] std::io::Error),
     #[error("cannot generate an agent id: {0}")]
     AgentId(getrandom::Error),
+}
+
+/// Outcome of asking the identity provider for an access token.
+pub enum Access {
+    /// A usable access token.
+    Token(SecretString),
+    /// The provider refused the saved refresh token (`invalid_grant`): enrolment must run again.
+    Rejected,
+    /// The provider could not be reached or answered unexpectedly; the credential is kept.
+    Unavailable,
 }
 
 #[derive(Deserialize)]
@@ -129,10 +142,10 @@ impl Session {
         self.credential.as_ref().map(|c| c.agent_id.clone())
     }
 
-    /// Returns a usable access token, refreshing it when only the refresh token is left.
-    pub async fn access(&mut self, shutdown: &mut watch::Receiver<bool>) -> Option<SecretString> {
+    /// Returns a usable access token, renewing it when none is cached.
+    pub async fn access(&mut self, shutdown: &mut watch::Receiver<bool>) -> Access {
         if let Some(access) = &self.access {
-            return Some(access.clone());
+            return Access::Token(access.clone());
         }
         self.renew(shutdown).await
     }
@@ -165,18 +178,22 @@ impl Session {
         }
     }
 
-    /// Uses the refresh token to obtain a new access token; `None` when it is no longer valid.
-    pub async fn renew(&mut self, shutdown: &mut watch::Receiver<bool>) -> Option<SecretString> {
-        let refresh = self.credential.as_ref()?.refresh_token.clone();
+    /// Uses the refresh token to obtain a new access token. Only a refusal with
+    /// `invalid_grant` is `Rejected`; every other failure keeps the credential for a later retry.
+    pub async fn renew(&mut self, shutdown: &mut watch::Receiver<bool>) -> Access {
+        let Some(refresh) = self.credential.as_ref().map(|c| c.refresh_token.clone()) else {
+            return Access::Rejected;
+        };
         let endpoints = match self.endpoints().await {
             Ok(endpoints) => endpoints,
             Err(error) => {
                 tracing::warn!(%error, "auth.endpoints_failed");
-                return None;
+                return Access::Unavailable;
             }
         };
-        let answer = tokio::select! {
-            result = self.http
+        let sent = tokio::select! {
+            result = self
+                .http
                 .post(&endpoints.token)
                 .form(&[
                     ("grant_type", "refresh_token"),
@@ -184,32 +201,36 @@ impl Session {
                     ("client_id", self.client_id.as_str()),
                 ])
                 .send() => result,
-            () = triggered(shutdown) => return None,
+            () = triggered(shutdown) => return Access::Unavailable,
         };
-        let answer = match answer {
+        let response = match sent {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(%error, "auth.refresh_failed");
-                return None;
+                return Access::Unavailable;
             }
         };
-        if !answer.status().is_success() {
-            tracing::info!(status = %answer.status(), "auth.refresh_rejected");
-            return None;
+        let status = response.status();
+        if !status.is_success() {
+            return refusal(status, response).await;
         }
-        let answer: TokenAnswer = answer.json().await.ok()?;
-        let access = answer.access_token.map(SecretString::new)?;
+        let Ok(answer) = response.json::<TokenAnswer>().await else {
+            tracing::warn!("auth.refresh_unexpected_body");
+            return Access::Unavailable;
+        };
+        let Some(access) = answer.access_token.map(SecretString::new) else {
+            tracing::warn!("auth.refresh_unexpected_body");
+            return Access::Unavailable;
+        };
         if let Some(rotated) = answer.refresh_token
             && let Some(credential) = self.credential.as_mut()
         {
             credential.refresh_token = SecretString::new(rotated);
-            if let Err(error) = credential::save(&self.credential_file, credential) {
-                tracing::warn!(%error, "credential.save_failed");
-            }
+            save_with_retry(&self.credential_file, credential).await;
         }
         self.access = Some(access.clone());
         tracing::info!("auth.refreshed");
-        Some(access)
+        Access::Token(access)
     }
 
     async fn enroll_once(&mut self) -> Result<SecretString, AuthError> {
@@ -319,6 +340,42 @@ impl Session {
     }
 }
 
+/// Classifies a refused refresh. Only `invalid_grant` means the saved credential no longer works;
+/// server errors, rate limits and anything unexpected leave it in place.
+async fn refusal(status: StatusCode, response: reqwest::Response) -> Access {
+    let error = response
+        .json::<TokenAnswer>()
+        .await
+        .ok()
+        .and_then(|answer| answer.error);
+    if error.as_deref() == Some("invalid_grant") {
+        tracing::info!(%status, "auth.refresh_rejected");
+        return Access::Rejected;
+    }
+    tracing::warn!(
+        %status,
+        error = error.as_deref().unwrap_or("none"),
+        "auth.refresh_unavailable"
+    );
+    Access::Unavailable
+}
+
+/// Persists a rotated refresh token. The previous one is already invalid at the provider, so a
+/// failed write is retried and logged; a restart before a successful write falls back to enrolment.
+async fn save_with_retry(path: &Path, credential: &Credential) {
+    for attempt in 1..=SAVE_ATTEMPTS {
+        match credential::save(path, credential) {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::error!(%error, attempt, "credential.save_failed");
+                if attempt < SAVE_ATTEMPTS {
+                    tokio::time::sleep(SAVE_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+}
+
 fn normalize(url: &str) -> &str {
     url.trim_end_matches('/')
 }
@@ -331,162 +388,5 @@ fn generate_agent_id() -> Result<AgentId, AuthError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::convert::Infallible;
-    use std::net::SocketAddr;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    use http::{Method, Request, Response, StatusCode, header};
-    use http_body_util::{BodyExt, Full};
-    use hyper::body::Incoming;
-    use hyper::server::conn::http1;
-    use hyper::service::service_fn;
-    use hyper_util::rt::TokioIo;
-    use serde_json::json;
-    use tokio::net::TcpListener;
-
-    use super::*;
-
-    fn config(issuer: &str, resource: &str, file: &std::path::Path) -> Config {
-        let pairs = [
-            ("AGENT_RELAY_URL", "http://127.0.0.1:8443".to_owned()),
-            ("AGENT_UPSTREAM_URL", "http://127.0.0.1:30001".to_owned()),
-            ("AGENT_AUTH_ISSUER", issuer.to_owned()),
-            ("AGENT_AUTH_CLIENT_ID", "reverse-agent".to_owned()),
-            ("AGENT_AUTH_RESOURCE", resource.to_owned()),
-            ("AGENT_CREDENTIAL_FILE", file.display().to_string()),
-        ];
-        let map: std::collections::HashMap<&str, String> = pairs.into();
-        Config::from_env(&reverse_core::config::Env::new(move |key| {
-            map.get(key).cloned()
-        }))
-        .unwrap()
-    }
-
-    async fn idp(
-        addr: SocketAddr,
-        polls: Arc<AtomicU32>,
-    ) -> impl Fn(
-        Request<Incoming>,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<Response<Full<bytes::Bytes>>, Infallible>> + Send>,
-    > + Clone {
-        let base = format!("http://{addr}");
-        move |request: Request<Incoming>| {
-            let base = base.clone();
-            let polls = polls.clone();
-            Box::pin(async move {
-                let (parts, body) = request.into_parts();
-                let bytes = body
-                    .collect()
-                    .await
-                    .map_or_else(|_| Default::default(), |b| b.to_bytes());
-                let form = String::from_utf8_lossy(&bytes).to_string();
-                let reply = match (parts.method, parts.uri.path()) {
-                    (Method::GET, "/.well-known/openid-configuration") => json_reply(json!({
-                        "issuer": base,
-                        "device_authorization_endpoint": format!("{base}/device"),
-                        "token_endpoint": format!("{base}/token"),
-                    })),
-                    (Method::POST, "/device") => json_reply(json!({
-                        "device_code": "device-1",
-                        "user_code": "ABCD-EFGH",
-                        "verification_uri_complete": format!("{base}/device?code=ABCD-EFGH"),
-                        "interval": 1,
-                        "expires_in": 60,
-                    })),
-                    (Method::POST, "/token") if form.contains("device_code") => {
-                        if polls.fetch_add(1, Ordering::Relaxed) == 0 {
-                            json_reply(json!({ "error": "authorization_pending" }))
-                        } else {
-                            json_reply(json!({
-                                "access_token": "access-1",
-                                "refresh_token": "refresh-1",
-                                "token_type": "Bearer",
-                            }))
-                        }
-                    }
-                    (Method::POST, "/token") if form.contains("refresh_token=refresh-1") => {
-                        json_reply(json!({
-                            "access_token": "access-2",
-                            "refresh_token": "refresh-2",
-                            "token_type": "Bearer",
-                        }))
-                    }
-                    (Method::POST, "/token") => {
-                        let mut response = json_reply(json!({ "error": "invalid_grant" }));
-                        *response.status_mut() = StatusCode::BAD_REQUEST;
-                        response
-                    }
-                    _ => Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(Full::new(bytes::Bytes::new()))
-                        .unwrap(),
-                };
-                Ok(reply)
-            })
-        }
-    }
-
-    fn json_reply(body: serde_json::Value) -> Response<Full<bytes::Bytes>> {
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Full::new(bytes::Bytes::from(body.to_string())))
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn the_device_flow_saves_a_rotating_credential_and_renews_it() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let polls = Arc::new(AtomicU32::new(0));
-        let handler = idp(addr, polls).await;
-        tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let handler = handler.clone();
-                tokio::spawn(async move {
-                    let _ = http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service_fn(handler))
-                        .await;
-                });
-            }
-        });
-
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("credential");
-        let config = config(&format!("http://{addr}"), "http://127.0.0.1:8443", &file);
-        let mut session = Session::new(&config).unwrap();
-        session.load();
-        let (_stop, mut shutdown) = watch::channel(false);
-
-        assert!(session.access(&mut shutdown).await.is_none());
-        assert!(session.enroll(&mut shutdown).await);
-        assert_eq!(
-            session.access(&mut shutdown).await.unwrap().expose(),
-            "access-1"
-        );
-        let stored = credential::load(&file).unwrap().unwrap();
-        assert_eq!(stored.refresh_token.expose(), "refresh-1");
-
-        assert_eq!(
-            session.renew(&mut shutdown).await.unwrap().expose(),
-            "access-2"
-        );
-        let stored = credential::load(&file).unwrap().unwrap();
-        assert_eq!(stored.refresh_token.expose(), "refresh-2");
-
-        session.forget();
-        assert!(credential::load(&file).unwrap().is_none());
-    }
-
-    #[test]
-    fn agent_ids_are_validated_after_generation() {
-        let id = generate_agent_id().unwrap();
-        assert_eq!(id.as_str().len(), AGENT_ID_LEN);
-    }
-}
+#[path = "auth_tests.rs"]
+mod tests;

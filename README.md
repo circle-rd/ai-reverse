@@ -44,8 +44,10 @@ flowchart LR
   outbound, initiated by the agent.
 - The agent authorizes itself through the AuthService device flow: a human
   approves a short-lived code in the browser, the refresh token and agent id
-  are persisted with mode 0600, and they are forgotten when the identity
-  provider stops accepting them.
+  are persisted with mode 0600. The credential is forgotten only when the
+  identity provider answers `invalid_grant` (expired, reused or revoked refresh
+  token). Network failures and provider outages keep it and retry with backoff,
+  so a restart during an outage does not require a new approval.
 - The relay verifies AuthService-issued access tokens offline against the
   published JWKS; tokens must carry the relay URL as audience and the
   `tunnel:serve` scope. The relay never issues credentials of its own.
@@ -100,6 +102,10 @@ docker compose logs -f reverse-agent
 On the first start the agent begins the device flow and prints a verification
 link and a user code; open the link, sign in and approve. The refresh token and
 the agent id are kept in the `agent-state` volume and reused across restarts.
+A restart reuses them without asking for approval; a new approval is needed only
+after the provider rejects the refresh token. The refresh token rotates on each
+renewal and, with the provider's default policy, expires after 30 days without
+use.
 
 Equivalent plain `docker run`:
 
