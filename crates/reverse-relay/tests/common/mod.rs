@@ -179,6 +179,8 @@ impl Stack {
             ("RELAY_MODELS_POLL_SECS", "1".into()),
             ("RELAY_DEREGISTER_GRACE_SECS", "2".into()),
             ("RELAY_RECONCILE_INTERVAL_SECS", "1".into()),
+            ("RELAY_CATALOGUE_CLIENT_ID", "reverse-relay".into()),
+            ("RELAY_CATALOGUE_CLIENT_SECRET", "relay-secret".into()),
         ];
         if let Some(cap) = options.max_tunnels_per_user {
             relay_pairs.push(("RELAY_MAX_TUNNELS_PER_USER", cap.to_owned()));

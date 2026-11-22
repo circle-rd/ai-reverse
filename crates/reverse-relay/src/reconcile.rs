@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use reverse_core::ids::{ClientId, ModelName};
 use reverse_core::shutdown::triggered;
 use reverse_core::wire::ModelMetadata;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 
@@ -98,13 +98,24 @@ pub fn plan(wanted: &BTreeMap<(ClientId, ModelName), ModelMetadata>, actual: &[M
     Plan { create, delete }
 }
 
+/// Applies the wanted set. Signals `catalogue` once the mutations are over, whatever their
+/// outcome: auth-service re-reads LiteLLM itself, so a partial change still needs announcing.
 async fn apply(
     litellm: &LiteLlm,
     wanted: &BTreeMap<(ClientId, ModelName), ModelMetadata>,
+    catalogue: &Notify,
 ) -> Result<(), LiteLlmError> {
     let actual = litellm.list_managed().await?;
     let plan = plan(wanted, &actual);
+    let changes = !plan.create.is_empty() || !plan.delete.is_empty();
+    let outcome = mutate(litellm, plan).await;
+    if changes {
+        catalogue.notify_one();
+    }
+    outcome
+}
 
+async fn mutate(litellm: &LiteLlm, plan: Plan) -> Result<(), LiteLlmError> {
     // Deleting before creating keeps an alias from being registered twice.
     let mut tasks: JoinSet<(String, Result<(), LiteLlmError>)> = JoinSet::new();
     let mut pending = plan.delete.into_iter();
@@ -172,6 +183,7 @@ pub async fn run(
     registry: Arc<Registry>,
     litellm: LiteLlm,
     timing: Timing,
+    catalogue: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ticker = interval(timing.interval);
@@ -189,7 +201,7 @@ pub async fn run(
         if applied.as_ref() == Some(&wanted) && !resync_due {
             continue;
         }
-        match apply(&litellm, &wanted).await {
+        match apply(&litellm, &wanted, &catalogue).await {
             Ok(()) => {
                 applied = Some(wanted);
                 last_sync = Some(Instant::now());
@@ -201,7 +213,12 @@ pub async fn run(
             }
         }
     }
-    match tokio::time::timeout(FINAL_CLEANUP_TIMEOUT, apply(&litellm, &BTreeMap::new())).await {
+    match tokio::time::timeout(
+        FINAL_CLEANUP_TIMEOUT,
+        apply(&litellm, &BTreeMap::new(), &catalogue),
+    )
+    .await
+    {
         Ok(Ok(())) => tracing::info!("litellm.cleaned_up"),
         Ok(Err(error)) => tracing::warn!(%error, "litellm.cleanup_failed"),
         Err(_) => tracing::warn!("litellm.cleanup_timeout"),

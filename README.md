@@ -206,8 +206,18 @@ Plain-text transport to a non-loopback relay is refused unless
 | `RELAY_AUTH_FAILURE_WINDOW_SECS` | no | Window counting failures. Default 60. |
 | `RELAY_AUTH_LOCKOUT_SECS` | no | Initial lockout; doubles up to 8x. Default 60. |
 | `RELAY_TRUST_FORWARDED_FOR` | no | `true`/`false`: trust the last `X-Forwarded-For` entry. Default `false`. |
+| `RELAY_CATALOGUE_CLIENT_ID` | no* | Confidential auth-service client the relay uses to notify model changes; `reverse-relay` when provisioned by the LiteLLM setup. |
+| `RELAY_CATALOGUE_CLIENT_SECRET` | no* | Secret of that client; `_FILE` form accepted. |
 
-`*` Exactly one of the direct and `_FILE` forms is required per secret. Supply
+`*` The two catalogue variables are set together or not at all. Without them the
+relay stays silent and auth-service picks up model changes on its 5-minute sync.
+With them, each change of the served model set is announced to auth-service at
+`RELAY_AUTH_ISSUER` (`POST /api/internal/gateway/inventory-changed`) with a
+`gateway:inventory:sync` client-credentials token, so its model pickers refresh at
+once. The LiteLLM setup of auth-service provisions that client and its scope; the
+`RELAY_AUTH_ISSUER` must be the auth-service `BETTER_AUTH_URL` (the token audience).
+
+Exactly one of the direct and `_FILE` forms is required per secret. Supply
 `RELAY_LITELLM_API_KEY` in production; the master key falls back only for
 bootstrap and logs a warning. Both credentials can manage only deployments
 tagged `model_info.managed_by = "reverse-relay"`.

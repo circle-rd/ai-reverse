@@ -422,3 +422,36 @@ async fn an_account_cannot_exceed_its_tunnel_cap() {
     assert!(reply.starts_with("HTTP/1.1 429"), "{reply}");
     stack.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_registered_model_notifies_auth_service_once_it_is_visible() {
+    let stack = Stack::start(Options::default()).await;
+
+    eventually("the deployment to be registered", || async {
+        stack.litellm.row("tester/qwen3.8-27b")
+    })
+    .await;
+    eventually("auth-service to be notified", || async {
+        (stack.idp.notifications() > 0).then_some(())
+    })
+    .await;
+    stack.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unchanged_model_list_does_not_notify_again() {
+    let stack = Stack::start(Options::default()).await;
+
+    eventually("the deployment to be registered", || async {
+        stack.litellm.row("tester/qwen3.8-27b")
+    })
+    .await;
+    eventually("auth-service to be notified", || async {
+        (stack.idp.notifications() > 0).then_some(())
+    })
+    .await;
+    let settled = stack.idp.notifications();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(stack.idp.notifications(), settled);
+    stack.shutdown().await;
+}

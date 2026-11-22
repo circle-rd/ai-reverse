@@ -20,6 +20,23 @@ pub enum LiteLlmError {
     Url(String),
 }
 
+/// The catalogue notification to auth-service failed.
+#[derive(Debug, Error)]
+pub enum NotifyError {
+    /// The HTTP exchange failed.
+    #[error("notification request failed: {0}")]
+    Http(#[from] reqwest::Error),
+    /// The identity provider answered for another issuer.
+    #[error("identity provider issuer mismatch")]
+    IssuerMismatch,
+    /// The token request could not be encoded.
+    #[error("invalid token request: {0}")]
+    Body(String),
+    /// auth-service answered something other than `202 Accepted`.
+    #[error("auth-service answered {0}")]
+    Status(StatusCode),
+}
+
 /// The relay could not start.
 #[derive(Debug, Error)]
 pub enum RelayError {
@@ -40,6 +57,9 @@ pub enum RelayError {
     /// The token verifier's HTTP client could not be built.
     #[error("cannot build the identity provider client: {0}")]
     Auth(#[source] reqwest::Error),
+    /// The catalogue notifier's HTTP client could not be built.
+    #[error("cannot build the catalogue notifier client: {0}")]
+    Catalogue(#[source] reqwest::Error),
 }
 
 /// An agent's tunnel could not be established or kept.

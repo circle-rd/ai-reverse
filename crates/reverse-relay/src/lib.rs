@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod catalogue;
 pub mod config;
 pub mod crypto;
 pub mod error;
@@ -18,13 +19,14 @@ use std::sync::Arc;
 
 use reverse_core::wire::TUNNEL_PATH;
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 
 pub use config::Config;
 pub use error::RelayError;
 
 use crate::api::ApiState;
 use crate::auth::AuthState;
+use crate::catalogue::CatalogueNotifier;
 use crate::limiter::{FailureLimiter, LimiterConfig};
 use crate::litellm::LiteLlm;
 use crate::reconcile::Timing;
@@ -36,6 +38,7 @@ pub struct Relay {
     config: Config,
     auth: AuthState,
     litellm: LiteLlm,
+    catalogue: Option<CatalogueNotifier>,
     tunnel_listener: TcpListener,
     api_listener: TcpListener,
 }
@@ -47,10 +50,18 @@ impl Relay {
         let api_listener = bind(config.api_listen, "api").await?;
         let litellm = LiteLlm::new(&config).map_err(RelayError::LiteLlm)?;
         let auth = AuthState::new(&config).map_err(RelayError::Auth)?;
+        let catalogue = match &config.catalogue {
+            Some(credentials) => Some(
+                CatalogueNotifier::new(&config.auth_issuer, credentials.clone())
+                    .map_err(RelayError::Catalogue)?,
+            ),
+            None => None,
+        };
         Ok(Self {
             config,
             auth,
             litellm,
+            catalogue,
             tunnel_listener,
             api_listener,
         })
@@ -102,6 +113,17 @@ impl Relay {
         if config.litellm_management_uses_master {
             tracing::warn!("relay.litellm_master_key_fallback");
         }
+        let catalogue_signal = Arc::new(Notify::new());
+        let catalogue_task = {
+            let signal = catalogue_signal.clone();
+            let stop = shutdown.clone();
+            let notifier = self.catalogue;
+            async move {
+                if let Some(notifier) = notifier {
+                    catalogue::run(notifier, signal, stop).await;
+                }
+            }
+        };
         tracing::info!(
             tunnel = ?self.tunnel_listener.local_addr().ok(),
             api = ?self.api_listener.local_addr().ok(),
@@ -134,7 +156,8 @@ impl Relay {
                 let state = api_state.clone();
                 move |request| api::handle(request, state.clone())
             }),
-            reconcile::run(registry, self.litellm, timing, shutdown),
+            reconcile::run(registry, self.litellm, timing, catalogue_signal, shutdown,),
+            catalogue_task,
         );
         tracing::info!("relay.stopped");
     }
