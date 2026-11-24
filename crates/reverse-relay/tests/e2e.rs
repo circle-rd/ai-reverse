@@ -27,6 +27,10 @@ async fn registers_the_served_model_and_streams_a_completion() {
     );
     assert_eq!(row["model_info"]["managed_by"], "reverse-relay");
     assert_eq!(row["model_info"]["created_by"], "tester");
+    assert_eq!(
+        row["model_info"]["hardware"][0]["cpuArch"],
+        std::env::consts::ARCH
+    );
 
     let reply = send(
         stack.relay_api,

@@ -6,14 +6,14 @@ use std::time::{Duration, Instant};
 
 use reverse_core::ids::{ClientId, ModelName};
 use reverse_core::shutdown::triggered;
-use reverse_core::wire::ModelMetadata;
+use reverse_core::wire::{HardwareInfo, ModelMetadata};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::error::LiteLlmError;
 use crate::litellm::{LiteLlm, Managed, Publish};
-use crate::registry::Registry;
+use crate::registry::{Advertised, Registry};
 
 const FINAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const APPLY_CONCURRENCY: usize = 8;
@@ -38,6 +38,8 @@ pub struct Desired {
     pub model: ModelName,
     /// Model metadata to publish in the deployment's `model_info`.
     pub metadata: ModelMetadata,
+    /// Hardware of the nodes serving the model, published in the deployment's `model_info`.
+    pub hardware: Vec<HardwareInfo>,
 }
 
 /// What to change in LiteLLM.
@@ -51,35 +53,39 @@ pub struct Plan {
 
 /// Diffs the wanted pairs against what LiteLLM holds.
 ///
-/// A deployment whose tags, owner or capability flags changed is replaced: LiteLLM has no
-/// partial update for `model_info`, and a stale classification is worse than one more round
-/// trip.
+/// A deployment whose tags, owner, capability flags or hardware changed is replaced: LiteLLM
+/// has no partial update for `model_info`, and a stale classification is worse than one more
+/// round trip.
 #[must_use]
-pub fn plan(wanted: &BTreeMap<(ClientId, ModelName), ModelMetadata>, actual: &[Managed]) -> Plan {
-    let wanted_by_name: HashMap<String, (&ClientId, &ModelMetadata)> = wanted
+pub fn plan(wanted: &BTreeMap<(ClientId, ModelName), Advertised>, actual: &[Managed]) -> Plan {
+    let wanted_by_name: HashMap<String, (&ClientId, &Advertised)> = wanted
         .iter()
-        .map(|((client, model), metadata)| (format!("{client}/{model}"), (client, metadata)))
+        .map(|((client, model), advertised)| (format!("{client}/{model}"), (client, advertised)))
         .collect();
     let mut kept = HashSet::new();
     let mut delete = Vec::new();
     for row in actual {
         let keep = match &row.reverse_name {
-            Some(name) => wanted_by_name.get(name).is_some_and(|(client, metadata)| {
-                let wanted_tags: Vec<String> = metadata
-                    .tags
-                    .iter()
-                    .map(|tag| tag.as_str().to_owned())
-                    .collect();
-                let publish = Publish::from_tags(&metadata.tags);
-                row.tags == wanted_tags
-                    && row.hub_owner.as_deref() == metadata.hub_owner.as_deref()
-                    && row.hub_avatar_url.as_deref() == metadata.hub_avatar_url.as_deref()
-                    && row.author_safety_claim == metadata.author_safety_claim
-                    && row.created_by.as_deref() == Some(client.as_str())
-                    && row.mode.as_deref() == publish.mode
-                    && row.supports == publish.supports
-                    && kept.insert(name.clone())
-            }),
+            Some(name) => wanted_by_name
+                .get(name)
+                .is_some_and(|(client, advertised)| {
+                    let metadata = &advertised.metadata;
+                    let wanted_tags: Vec<String> = metadata
+                        .tags
+                        .iter()
+                        .map(|tag| tag.as_str().to_owned())
+                        .collect();
+                    let publish = Publish::from_tags(&metadata.tags);
+                    row.tags == wanted_tags
+                        && row.hub_owner.as_deref() == metadata.hub_owner.as_deref()
+                        && row.hub_avatar_url.as_deref() == metadata.hub_avatar_url.as_deref()
+                        && row.author_safety_claim == metadata.author_safety_claim
+                        && row.created_by.as_deref() == Some(client.as_str())
+                        && row.mode.as_deref() == publish.mode
+                        && row.supports == publish.supports
+                        && row.hardware == advertised.hardware
+                        && kept.insert(name.clone())
+                }),
             None => false,
         };
         if !keep {
@@ -89,10 +95,11 @@ pub fn plan(wanted: &BTreeMap<(ClientId, ModelName), ModelMetadata>, actual: &[M
     let create = wanted
         .iter()
         .filter(|((client, model), _)| !kept.contains(&format!("{client}/{model}")))
-        .map(|((client, model), metadata)| Desired {
+        .map(|((client, model), advertised)| Desired {
             client: client.clone(),
             model: model.clone(),
-            metadata: metadata.clone(),
+            metadata: advertised.metadata.clone(),
+            hardware: advertised.hardware.clone(),
         })
         .collect();
     Plan { create, delete }
@@ -102,7 +109,7 @@ pub fn plan(wanted: &BTreeMap<(ClientId, ModelName), ModelMetadata>, actual: &[M
 /// outcome: auth-service re-reads LiteLLM itself, so a partial change still needs announcing.
 async fn apply(
     litellm: &LiteLlm,
-    wanted: &BTreeMap<(ClientId, ModelName), ModelMetadata>,
+    wanted: &BTreeMap<(ClientId, ModelName), Advertised>,
     catalogue: &Notify,
 ) -> Result<(), LiteLlmError> {
     let actual = litellm.list_managed().await?;
@@ -153,7 +160,12 @@ async fn mutate(litellm: &LiteLlm, plan: Plan) -> Result<(), LiteLlmError> {
             let litellm = litellm.clone();
             tasks.spawn(async move {
                 let result = litellm
-                    .create(&desired.client, &desired.model, &desired.metadata)
+                    .create(
+                        &desired.client,
+                        &desired.model,
+                        &desired.metadata,
+                        &desired.hardware,
+                    )
                     .await;
                 (desired.client, desired.model, result)
             });
@@ -188,7 +200,7 @@ pub async fn run(
 ) {
     let mut ticker = interval(timing.interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut applied: Option<BTreeMap<(ClientId, ModelName), ModelMetadata>> = None;
+    let mut applied: Option<BTreeMap<(ClientId, ModelName), Advertised>> = None;
     let mut last_sync: Option<Instant> = None;
     loop {
         tokio::select! {
@@ -229,7 +241,7 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::litellm::Supports;
-    use reverse_core::wire::{AuthorSafetyClaim, ModelTag};
+    use reverse_core::wire::{AuthorSafetyClaim, HardwareKind, ModelTag};
 
     fn pair(client: &str, model: &str) -> (ClientId, ModelName) {
         (
@@ -240,19 +252,34 @@ mod tests {
 
     fn wanted(
         entries: &[(&str, &str, &[ModelTag])],
-    ) -> BTreeMap<(ClientId, ModelName), ModelMetadata> {
+    ) -> BTreeMap<(ClientId, ModelName), Advertised> {
         entries
             .iter()
             .map(|(client, model, tags)| {
                 (
                     pair(client, model),
-                    ModelMetadata {
-                        tags: tags.to_vec(),
-                        ..ModelMetadata::default()
+                    Advertised {
+                        metadata: ModelMetadata {
+                            tags: tags.to_vec(),
+                            ..ModelMetadata::default()
+                        },
+                        hardware: Vec::new(),
                     },
                 )
             })
             .collect()
+    }
+
+    fn gb10() -> HardwareInfo {
+        HardwareInfo {
+            kind: HardwareKind::DgxSpark,
+            product: Some("NVIDIA DGX Spark".to_owned()),
+            vendor: None,
+            gpus: vec!["NVIDIA GB10".to_owned()],
+            memory_mb: 122_880,
+            cpu_arch: "aarch64".to_owned(),
+            cpu_cores: 20,
+        }
     }
 
     fn row(id: &str, name: Option<&str>, tags: &[&str]) -> Managed {
@@ -270,6 +297,7 @@ mod tests {
             author_safety_claim: None,
             mode: publish.mode.map(str::to_owned),
             supports: publish.supports,
+            hardware: Vec::new(),
         }
     }
 
@@ -296,6 +324,7 @@ mod tests {
                     tags: vec![ModelTag::Text],
                     ..ModelMetadata::default()
                 },
+                hardware: Vec::new(),
             }]
         );
         assert_eq!(plan.delete, vec!["1".to_owned()]);
@@ -331,7 +360,13 @@ mod tests {
             hub_avatar_url: Some("https://cdn-avatars.huggingface.co/avatar.png".to_owned()),
             author_safety_claim: Some(AuthorSafetyClaim::Abliterated),
         };
-        let wanted = BTreeMap::from([((client.clone(), model.clone()), metadata.clone())]);
+        let wanted = BTreeMap::from([(
+            (client.clone(), model.clone()),
+            Advertised {
+                metadata: metadata.clone(),
+                hardware: Vec::new(),
+            },
+        )]);
         let mut actual = row("1", Some("tester/Org/model"), &["text"]);
         actual.hub_owner = metadata.hub_owner.clone();
         actual.hub_avatar_url = metadata.hub_avatar_url.clone();
@@ -342,6 +377,28 @@ mod tests {
         let plan = plan(&wanted, &[actual]);
         assert_eq!(plan.delete, vec!["1".to_owned()]);
         assert_eq!(plan.create[0].metadata, metadata);
+    }
+
+    #[test]
+    fn keeps_a_deployment_whose_hardware_is_unchanged() {
+        let mut wanted = wanted(&[("tester", "m", &[ModelTag::Text])]);
+        for advertised in wanted.values_mut() {
+            advertised.hardware = vec![gb10()];
+        }
+        let mut actual = row("1", Some("tester/m"), &["text"]);
+        actual.hardware = vec![gb10()];
+        assert_eq!(plan(&wanted, &[actual]), Plan::default());
+    }
+
+    #[test]
+    fn replaces_a_deployment_whose_hardware_changed() {
+        let mut wanted = wanted(&[("tester", "m", &[ModelTag::Text])]);
+        for advertised in wanted.values_mut() {
+            advertised.hardware = vec![gb10()];
+        }
+        let plan = plan(&wanted, &[row("1", Some("tester/m"), &["text"])]);
+        assert_eq!(plan.delete, vec!["1".to_owned()]);
+        assert_eq!(plan.create[0].hardware, vec![gb10()]);
     }
 
     #[test]

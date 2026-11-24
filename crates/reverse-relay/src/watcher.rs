@@ -30,6 +30,15 @@ pub async fn run(
 ) {
     let mut ticker = interval(every);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    match fetch_info(&mut sender, request_timeout).await {
+        Ok(info) => registry.record_hardware(&client, &node_id, info.hardware),
+        Err(PollError::Status(status)) if status == StatusCode::NOT_FOUND => {
+            tracing::debug!(client_id = %client, %node_id, "agent.info_unsupported");
+        }
+        Err(error) => {
+            tracing::warn!(client_id = %client, %node_id, %error, "agent.info_failed");
+        }
+    }
     let mut failures = 0_u32;
     loop {
         ticker.tick().await;

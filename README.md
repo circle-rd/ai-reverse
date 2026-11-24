@@ -278,7 +278,13 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
   `model_info.created_by = "{account}"`, in addition to `client_id` and
   `reverse_name`. This distinguishes models learned by the relay from models
   configured directly in LiteLLM, even when both have the same owner.
-- Changing tags, owner, avatar, author claim or capability flags replaces the
+- Each deployment carries `model_info.hardware`: the self-reported host facts
+  (`kind`, `product`, `vendor`, `gpus`, `memoryMb`, `cpuArch`, `cpuCores`) of the
+  connected agents that serve the model, distinct and ordered by node id. The
+  relay reads them once per tunnel from `/_agent/info`; an agent without that
+  endpoint, or a failed read, publishes no hardware. The facts are not verified:
+  consumers must treat them as declarations, never for billing or authorization.
+- Changing tags, owner, avatar, author claim, capability flags or hardware replaces the
   deployment on the next reconcile: LiteLLM has no partial `model_info` update,
   so the old row is deleted and recreated with the new metadata.
 - The relay registers one deployment per `{account}/{model}` alias. Several

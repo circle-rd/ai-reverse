@@ -8,16 +8,45 @@ use std::time::{Duration, Instant};
 use hyper::client::conn::http2::SendRequest;
 use reverse_core::body::ProxyBody;
 use reverse_core::ids::{ClientId, ModelName};
-use reverse_core::wire::ModelMetadata;
+use reverse_core::wire::{HardwareInfo, ModelMetadata};
 use tokio::sync::Notify;
 
 /// A handle to send requests through one agent's tunnel.
 pub type TunnelSender = SendRequest<ProxyBody>;
 
-/// Last-seen time and metadata of one `(client, model)` pair.
+/// What the relay publishes for one `(client, model)` pair: the model's metadata and the
+/// hardware of the connected nodes that serve it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Advertised {
+    pub metadata: ModelMetadata,
+    pub hardware: Vec<HardwareInfo>,
+}
+
+/// Last-seen time and advertised data of one `(client, model)` pair.
 struct Sighting {
     last: Instant,
-    metadata: ModelMetadata,
+    advertised: Advertised,
+}
+
+/// Distinct hardware of the connected nodes that serve a model, ordered by node id.
+///
+/// Built from every node so the result does not depend on which node polled last.
+fn published_hardware<'a>(
+    nodes: impl Iterator<Item = (&'a str, Option<&'a HardwareInfo>, bool)>,
+) -> Vec<HardwareInfo> {
+    let mut found: Vec<(&str, &HardwareInfo)> = nodes
+        .filter_map(|(node, hardware, serves)| {
+            serves.then_some(hardware).flatten().map(|hw| (node, hw))
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(b.0));
+    let mut published: Vec<HardwareInfo> = Vec::new();
+    for (_, hardware) in found {
+        if !published.iter().any(|known| known == hardware) {
+            published.push(hardware.clone());
+        }
+    }
+    published
 }
 
 /// Last-seen times of `(client, model)` pairs.
@@ -33,16 +62,16 @@ impl ModelBook {
     fn observe(
         &mut self,
         client: &ClientId,
-        models: &[(ModelName, ModelMetadata)],
+        models: &[(ModelName, Advertised)],
         now: Instant,
     ) -> bool {
         let mut changed = false;
-        for (model, metadata) in models {
+        for (model, advertised) in models {
             match self.seen.get_mut(&(client.clone(), model.clone())) {
                 Some(sighting) => {
                     sighting.last = now;
-                    if sighting.metadata != *metadata {
-                        sighting.metadata.clone_from(metadata);
+                    if sighting.advertised != *advertised {
+                        sighting.advertised.clone_from(advertised);
                         changed = true;
                     }
                 }
@@ -51,7 +80,7 @@ impl ModelBook {
                         (client.clone(), model.clone()),
                         Sighting {
                             last: now,
-                            metadata: metadata.clone(),
+                            advertised: advertised.clone(),
                         },
                     );
                     changed = true;
@@ -65,12 +94,12 @@ impl ModelBook {
         &mut self,
         grace: Duration,
         now: Instant,
-    ) -> BTreeMap<(ClientId, ModelName), ModelMetadata> {
+    ) -> BTreeMap<(ClientId, ModelName), Advertised> {
         self.seen
             .retain(|_, sighting| now.saturating_duration_since(sighting.last) <= grace);
         self.seen
             .iter()
-            .map(|(pair, sighting)| (pair.clone(), sighting.metadata.clone()))
+            .map(|(pair, sighting)| (pair.clone(), sighting.advertised.clone()))
             .collect()
     }
 }
@@ -116,6 +145,7 @@ struct Tunnel {
     node_id: String,
     inflight: Arc<AtomicUsize>,
     models: BTreeMap<ModelName, ModelMetadata>,
+    hardware: Option<HardwareInfo>,
     last_used: u64,
 }
 
@@ -212,6 +242,7 @@ impl Registry {
             node_id: node_id.clone(),
             inflight: Arc::new(AtomicUsize::new(0)),
             models: BTreeMap::new(),
+            hardware: None,
             last_used: 0,
         });
         drop(inner);
@@ -321,27 +352,57 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    /// Records the models a connected node serves right now.
-    pub fn observe(&self, client: &ClientId, node_id: &str, models: &[(ModelName, ModelMetadata)]) {
+    /// Records the hardware a connected node reported about its host.
+    pub fn record_hardware(&self, client: &ClientId, node_id: &str, hardware: HardwareInfo) {
         let mut inner = self.lock();
-        let Some(tunnel) = inner
+        if let Some(tunnel) = inner
             .tunnels
             .get_mut(client)
             .and_then(|all| all.iter_mut().find(|t| t.node_id == node_id))
-        else {
+        {
+            tunnel.hardware = Some(hardware);
+        }
+    }
+
+    /// Records the models a connected node serves right now.
+    pub fn observe(&self, client: &ClientId, node_id: &str, models: &[(ModelName, ModelMetadata)]) {
+        let mut inner = self.lock();
+        let Some(tunnels) = inner.tunnels.get_mut(client) else {
+            return;
+        };
+        let Some(tunnel) = tunnels.iter_mut().find(|t| t.node_id == node_id) else {
             return;
         };
         tunnel.models = models.iter().cloned().collect();
-        let changed = inner.book.observe(client, models, Instant::now());
+        let advertised: Vec<(ModelName, Advertised)> = models
+            .iter()
+            .map(|(model, metadata)| {
+                let hardware = published_hardware(tunnels.iter().map(|t| {
+                    (
+                        t.node_id.as_str(),
+                        t.hardware.as_ref(),
+                        t.models.contains_key(model),
+                    )
+                }));
+                (
+                    model.clone(),
+                    Advertised {
+                        metadata: metadata.clone(),
+                        hardware,
+                    },
+                )
+            })
+            .collect();
+        let changed = inner.book.observe(client, &advertised, Instant::now());
         drop(inner);
         if changed {
             self.changed.notify_one();
         }
     }
 
-    /// The pairs that must be registered in LiteLLM now, with their metadata.
+    /// The pairs that must be registered in LiteLLM now, with their advertised data.
     #[must_use]
-    pub fn wanted(&self, grace: Duration) -> BTreeMap<(ClientId, ModelName), ModelMetadata> {
+    pub fn wanted(&self, grace: Duration) -> BTreeMap<(ClientId, ModelName), Advertised> {
         self.lock().book.wanted(grace, Instant::now())
     }
 
@@ -354,7 +415,7 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reverse_core::wire::ModelTag;
+    use reverse_core::wire::{HardwareKind, ModelTag};
 
     fn pair(client: &str, model: &str) -> (ClientId, ModelName) {
         (
@@ -363,10 +424,13 @@ mod tests {
         )
     }
 
-    fn metadata(tags: &[ModelTag]) -> ModelMetadata {
-        ModelMetadata {
-            tags: tags.to_vec(),
-            ..ModelMetadata::default()
+    fn advertised(tags: &[ModelTag]) -> Advertised {
+        Advertised {
+            metadata: ModelMetadata {
+                tags: tags.to_vec(),
+                ..ModelMetadata::default()
+            },
+            hardware: Vec::new(),
         }
     }
 
@@ -389,7 +453,7 @@ mod tests {
         let mut book = ModelBook::default();
         let t0 = Instant::now();
         let (client, model) = pair("tester", "m1");
-        let models = vec![(model.clone(), metadata(&[ModelTag::Text]))];
+        let models = vec![(model.clone(), advertised(&[ModelTag::Text]))];
         assert!(book.observe(&client, &models, t0));
         let grace = Duration::from_secs(30);
         assert!(
@@ -404,7 +468,7 @@ mod tests {
         let mut book = ModelBook::default();
         let t0 = Instant::now();
         let (client, model) = pair("tester", "m1");
-        let models = vec![(model.clone(), metadata(&[ModelTag::Text]))];
+        let models = vec![(model.clone(), advertised(&[ModelTag::Text]))];
         assert!(book.observe(&client, &models, t0));
         assert!(!book.observe(&client, &models, t0 + Duration::from_secs(20)));
         assert_eq!(
@@ -419,7 +483,7 @@ mod tests {
         let mut book = ModelBook::default();
         let t0 = Instant::now();
         let (client, model) = pair("tester", "m1");
-        let models = vec![(model.clone(), metadata(&[ModelTag::Text]))];
+        let models = vec![(model.clone(), advertised(&[ModelTag::Text]))];
         book.observe(&client, &models, t0);
         assert!(
             book.wanted(Duration::from_secs(1), t0 + Duration::from_secs(5))
@@ -433,15 +497,18 @@ mod tests {
         let mut book = ModelBook::default();
         let t0 = Instant::now();
         let (client, model) = pair("tester", "m1");
-        let first = vec![(model.clone(), metadata(&[ModelTag::Text]))];
+        let first = vec![(model.clone(), advertised(&[ModelTag::Text]))];
         assert!(book.observe(&client, &first, t0));
 
         let enriched = vec![(
             model.clone(),
-            ModelMetadata {
-                hub_owner: Some("publisher".to_owned()),
-                hub_avatar_url: Some("https://huggingface.co/avatar.png".to_owned()),
-                ..metadata(&[ModelTag::Text])
+            Advertised {
+                metadata: ModelMetadata {
+                    hub_owner: Some("publisher".to_owned()),
+                    hub_avatar_url: Some("https://huggingface.co/avatar.png".to_owned()),
+                    ..advertised(&[ModelTag::Text]).metadata
+                },
+                hardware: Vec::new(),
             },
         )];
         assert!(book.observe(&client, &enriched, t0 + Duration::from_secs(1)));
@@ -458,14 +525,51 @@ mod tests {
         let mut book = ModelBook::default();
         let t0 = Instant::now();
         let (client, model) = pair("tester", "m1");
-        let first = vec![(model.clone(), metadata(&[ModelTag::Text]))];
-        let second = vec![(model.clone(), metadata(&[ModelTag::Text, ModelTag::Tools]))];
+        let first = vec![(model.clone(), advertised(&[ModelTag::Text]))];
+        let second = vec![(
+            model.clone(),
+            advertised(&[ModelTag::Text, ModelTag::Tools]),
+        )];
         book.observe(&client, &first, t0);
         book.observe(&client, &second, t0);
         let wanted = book.wanted(Duration::from_secs(30), t0);
         assert_eq!(
             wanted.get(&(client, model)),
-            Some(&metadata(&[ModelTag::Text, ModelTag::Tools]))
+            Some(&advertised(&[ModelTag::Text, ModelTag::Tools]))
         );
+    }
+
+    #[test]
+    fn published_hardware_lists_each_distinct_machine_serving_the_model_once() {
+        let dgx = HardwareInfo {
+            kind: HardwareKind::DgxSpark,
+            product: Some("NVIDIA DGX Spark".to_owned()),
+            vendor: None,
+            gpus: vec!["NVIDIA GB10".to_owned()],
+            memory_mb: 122_880,
+            cpu_arch: "aarch64".to_owned(),
+            cpu_cores: 20,
+        };
+        let other = HardwareInfo {
+            kind: HardwareKind::Other,
+            product: None,
+            vendor: None,
+            gpus: Vec::new(),
+            memory_mb: 0,
+            cpu_arch: "x86_64".to_owned(),
+            cpu_cores: 8,
+        };
+        let published = published_hardware(
+            [
+                ("b", Some(&other), true),
+                ("a", Some(&dgx), true),
+                ("c", Some(&dgx), true),
+                ("d", Some(&other), false),
+                ("e", None, true),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(published, vec![dgx.clone(), other.clone()]);
+        assert!(published_hardware([("a", None, true)].into_iter()).is_empty());
     }
 }
