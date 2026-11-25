@@ -57,6 +57,12 @@ pub struct Config {
     pub hf_timeout: Duration,
     /// Whether the hub is consulted at all; `off` keeps model ids on the box.
     pub hf_enabled: bool,
+    /// Concurrent requests the engine accepts, when it does not report it itself.
+    pub max_slots: Option<i32>,
+    /// Whether to time one short generation once the engine is up.
+    pub benchmark: bool,
+    /// Interval between samples of the engine, host and GPU load.
+    pub status_poll: Duration,
 }
 
 impl Config {
@@ -155,6 +161,28 @@ impl Config {
             ));
         }
 
+        let benchmark = match env.optional("AGENT_BENCHMARK")?.as_deref() {
+            None | Some("true") => true,
+            Some("false") => false,
+            Some(_) => {
+                return Err(ConfigError::invalid(
+                    "AGENT_BENCHMARK",
+                    "expected true/false",
+                ));
+            }
+        };
+        let max_slots = match env.optional("AGENT_MAX_SLOTS")? {
+            None => None,
+            Some(raw) => Some(
+                raw.parse::<i32>()
+                    .ok()
+                    .filter(|slots| *slots > 0)
+                    .ok_or_else(|| {
+                        ConfigError::invalid("AGENT_MAX_SLOTS", "expected a positive integer")
+                    })?,
+            ),
+        };
+
         Ok(Self {
             relay,
             auth_issuer,
@@ -181,6 +209,9 @@ impl Config {
             hf_token: env.secret("AGENT_HF_TOKEN")?,
             hf_timeout: env.duration_secs("AGENT_HF_TIMEOUT_SECS", 5)?,
             hf_enabled,
+            max_slots,
+            benchmark,
+            status_poll: env.duration_secs("AGENT_STATUS_POLL_SECS", 5)?,
         })
     }
 }

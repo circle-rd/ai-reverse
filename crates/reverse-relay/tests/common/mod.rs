@@ -207,6 +207,7 @@ impl Stack {
             ("AGENT_UPSTREAM_URL", format!("http://{}", engine.addr)),
             ("AGENT_UPSTREAM_API_KEY", options.agent_key.to_owned()),
             ("AGENT_MODELS_POLL_SECS", "1".to_owned()),
+            ("AGENT_BENCHMARK", "false".to_owned()),
             ("AGENT_HF_METADATA", "true".to_owned()),
             ("AGENT_HF_URL", format!("http://{}", hub.addr)),
         ];
@@ -254,6 +255,7 @@ impl Stack {
             ("AGENT_UPSTREAM_URL", format!("http://{}", self.engine.addr)),
             ("AGENT_UPSTREAM_API_KEY", ENGINE_KEY.into()),
             ("AGENT_MODELS_POLL_SECS", "1".into()),
+            ("AGENT_BENCHMARK", "false".into()),
             ("AGENT_HF_METADATA", "true".into()),
             ("AGENT_HF_URL", format!("http://{}", self.hub.addr)),
         ]))
@@ -283,6 +285,7 @@ impl Stack {
             ("AGENT_UPSTREAM_URL", format!("http://{}", engine.addr)),
             ("AGENT_UPSTREAM_API_KEY", ENGINE_KEY.into()),
             ("AGENT_MODELS_POLL_SECS", "1".into()),
+            ("AGENT_BENCHMARK", "false".into()),
             ("AGENT_HF_METADATA", "true".into()),
             ("AGENT_HF_URL", format!("http://{}", self.hub.addr)),
         ]))

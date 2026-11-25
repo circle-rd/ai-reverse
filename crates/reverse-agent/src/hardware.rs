@@ -32,7 +32,7 @@ pub fn detect(root: &Path) -> HardwareInfo {
         vendor,
         gpus,
         memory_mb: read("proc/meminfo")
-            .and_then(|text| mem_total_kib(&text))
+            .and_then(|text| meminfo_kib(&text, "MemTotal"))
             .map_or(0, |kib| kib / 1024),
         cpu_arch: std::env::consts::ARCH.to_owned(),
         cpu_cores: read("proc/cpuinfo").map_or(0, |text| count_processors(&text)),
@@ -66,10 +66,11 @@ fn gpu_model(text: &str) -> Option<String> {
         .filter(|model| !model.eq_ignore_ascii_case("unknown"))
 }
 
-fn mem_total_kib(meminfo: &str) -> Option<u64> {
+/// Reads one `Key:   N kB` line of `/proc/meminfo`.
+pub(crate) fn meminfo_kib(meminfo: &str, key: &str) -> Option<u64> {
     meminfo
         .lines()
-        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))?
         .split_whitespace()
         .next()?
         .parse()
@@ -184,7 +185,8 @@ mod tests {
 
     #[test]
     fn meminfo_without_a_total_is_ignored() {
-        assert_eq!(mem_total_kib("MemFree: 1 kB\n"), None);
-        assert_eq!(mem_total_kib("MemTotal: abc kB\n"), None);
+        assert_eq!(meminfo_kib("MemFree: 1 kB\n", "MemTotal"), None);
+        assert_eq!(meminfo_kib("MemTotal: abc kB\n", "MemTotal"), None);
+        assert_eq!(meminfo_kib("MemTotal: 4 kB\n", "MemTotal"), Some(4));
     }
 }

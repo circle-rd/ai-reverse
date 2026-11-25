@@ -22,6 +22,9 @@ pub enum UpstreamError {
     /// The configured engine key cannot be sent as a header.
     #[error(transparent)]
     Credential(#[from] InvalidHeaderSecret),
+    /// The answer body could not be read within its limit.
+    #[error("upstream body is unreadable: {0}")]
+    Body(String),
 }
 
 /// Polling the engine's model list failed.
@@ -65,6 +68,26 @@ pub enum CatalogError {
     /// The answer is not the expected JSON.
     #[error("model metadata is not valid JSON: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// The startup speed test could not produce a figure.
+#[derive(Debug, Error)]
+pub enum BenchmarkError {
+    /// The request itself failed.
+    #[error(transparent)]
+    Upstream(#[from] UpstreamError),
+    /// The engine refused the test request.
+    #[error("the engine answered {0}")]
+    Status(StatusCode),
+    /// The answer stream broke or exceeded its cap.
+    #[error("the answer stream failed: {0}")]
+    Stream(String),
+    /// The generation did not finish in time.
+    #[error("the generation did not finish within {0:?}")]
+    Timeout(Duration),
+    /// The engine answered without generating any text.
+    #[error("the engine generated no text")]
+    NoTokens,
 }
 
 /// Opening or running the tunnel failed.

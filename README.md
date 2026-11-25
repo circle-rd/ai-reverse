@@ -172,6 +172,9 @@ Required settings have no silent defaults. Supplying both `KEY` and
 | `AGENT_HF_URL` | no | Hub origin; `https` unless loopback. Default `https://huggingface.co`. |
 | `AGENT_HF_TOKEN` | no | Token for gated or private hub repositories. |
 | `AGENT_HF_TIMEOUT_SECS` | no | Bound on each Hub request. Default 5. |
+| `AGENT_MAX_SLOTS` | no | Concurrent requests the engine accepts, for engines that do not report it (SGLang, vLLM). A positive integer; wins over what the engine reports. |
+| `AGENT_BENCHMARK` | no | `true`/`false`: once the engine is up, send one fixed short generation to a text model and record time-to-first-token and tokens per second. Default `true`. |
+| `AGENT_STATUS_POLL_SECS` | no | Interval between load samples of the engine, host and GPUs. Default 5. |
 
 `*` Exactly one of the direct and `_FILE` forms is required when the secret is
 set. Secrets are never echoed in errors or logs.
@@ -285,6 +288,26 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
   relay reads them once per tunnel from `/_agent/info`; an agent without that
   endpoint, or a failed read, publishes no hardware. The facts are not verified:
   consumers must treat them as declarations, never for billing or authorization.
+- The agent also serves its live status at `/_agent/status` through the tunnel
+  (never to the public): the engine family and version, its running and queued
+  requests and slot capacity, a capacity state (`offline`, `idle`, `busy`,
+  `occupied`), the host uptime, CPU load, memory use and hottest thermal zone,
+  each GPU's utilisation, memory share, temperature and power draw, and the
+  agent's own speed test. A figure the agent cannot read is `-1`, never `0`.
+  This status is not written to `model_info`: it changes every few seconds and
+  would make the relay replace the deployment continuously.
+  - **Engine metrics.** The engine family is recognised from its Prometheus
+    metrics (`sglang:`, `vllm:`, `llamacpp:`). Start the engine with its metrics
+    option (`--enable-metrics` for SGLang, `--metrics` for llama.cpp) or the
+    status carries `hint: "metrics-disabled"`. llama.cpp reports its slot count
+    through `/props`; SGLang and vLLM do not expose their capacity, so set
+    `AGENT_MAX_SLOTS` or the status carries `hint: "capacity-not-exposed"`.
+    Without engine metrics the load falls back to the requests crossing the agent.
+  - **GPU figures** come from `nvidia-smi`, run by the agent when it is on the
+    `PATH`. The published agent image is `FROM scratch` and has no `nvidia-smi`:
+    run the agent natively, or in an image that has it, to get GPU load,
+    temperature and power. Without it `gpus` is empty. On a unified-memory GB10
+    machine the GPU memory share is the system memory share (`memoryShared`).
 - Changing tags, owner, avatar, author claim, capability flags or hardware replaces the
   deployment on the next reconcile: LiteLLM has no partial `model_info` update,
   so the old row is deleted and recreated with the new metadata.

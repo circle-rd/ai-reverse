@@ -17,6 +17,9 @@ pub const AGENT_MODELS_PATH: &str = "/_agent/models";
 /// Path the relay polls through the tunnel to learn what machine the agent runs on.
 pub const AGENT_INFO_PATH: &str = "/_agent/info";
 
+/// Path the relay polls through the tunnel to learn how loaded the agent and its host are.
+pub const AGENT_STATUS_PATH: &str = "/_agent/status";
+
 /// Authority used for requests sent through the tunnel; the connection already picks the peer.
 pub const TUNNEL_AUTHORITY: &str = "reverse-agent";
 

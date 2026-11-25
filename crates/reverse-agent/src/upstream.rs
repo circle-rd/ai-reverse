@@ -3,12 +3,13 @@
 use std::time::Duration;
 
 use http::uri::Authority;
-use http::{HeaderMap, Method, Request, Response, Uri, header};
+use http::{HeaderMap, Method, Request, Response, StatusCode, Uri, header};
+use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
-use reverse_core::body::ProxyBody;
+use reverse_core::body::{ProxyBody, empty};
 use reverse_core::secret::SecretString;
 
 use crate::config::Config;
@@ -66,5 +67,29 @@ impl Upstream {
             Err(_) => Err(UpstreamError::Timeout(self.headers_timeout)),
             Ok(result) => Ok(result?),
         }
+    }
+
+    /// Reads a small text answer within `budget`; the status is returned, not interpreted.
+    pub async fn get_text(
+        &self,
+        path: &str,
+        max_bytes: usize,
+        budget: Duration,
+    ) -> Result<(StatusCode, String), UpstreamError> {
+        let read = async {
+            let response = self
+                .send(Method::GET, path, HeaderMap::new(), empty())
+                .await?;
+            let status = response.status();
+            let bytes = Limited::new(response.into_body(), max_bytes)
+                .collect()
+                .await
+                .map_err(|e| UpstreamError::Body(e.to_string()))?
+                .to_bytes();
+            Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
+        };
+        tokio::time::timeout(budget, read)
+            .await
+            .map_err(|_| UpstreamError::Timeout(budget))?
     }
 }

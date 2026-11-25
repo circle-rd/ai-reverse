@@ -7,4 +7,5 @@ pub mod ids;
 pub mod logging;
 pub mod secret;
 pub mod shutdown;
+pub mod status;
 pub mod wire;
