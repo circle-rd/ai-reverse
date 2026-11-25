@@ -43,14 +43,14 @@ async fn many_agents_pool_into_one_alias() {
     }
 
     wait_until("the pooled alias to be registered", || {
-        stack.litellm.names() == ["tester/qwen3.8-27b"]
+        stack.litellm.names() == ["u-tester/qwen3.8-27b"]
     })
     .await;
     for _ in 0..20 {
         let reply = send(
             stack.relay_api,
             Method::POST,
-            "/tester/v1/chat/completions",
+            "/u-tester/v1/chat/completions",
             r#"{"model":"qwen3.8-27b","messages":[]}"#,
         )
         .await;

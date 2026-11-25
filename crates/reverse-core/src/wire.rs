@@ -82,6 +82,8 @@ pub enum ModelTag {
     Video,
     /// Speech recognition or synthesis.
     Speech,
+    /// Speech to text (audio transcription).
+    Transcription,
     /// Embedding vectors.
     Embedding,
     /// Reranking.
@@ -99,6 +101,7 @@ impl ModelTag {
             "image" => Some(Self::Image),
             "video" => Some(Self::Video),
             "speech" => Some(Self::Speech),
+            "transcription" => Some(Self::Transcription),
             "embedding" => Some(Self::Embedding),
             "rerank" => Some(Self::Rerank),
             _ => None,
@@ -115,6 +118,7 @@ impl ModelTag {
             Self::Image => "image",
             Self::Video => "video",
             Self::Speech => "speech",
+            Self::Transcription => "transcription",
             Self::Embedding => "embedding",
             Self::Rerank => "rerank",
         }
@@ -133,8 +137,10 @@ impl ModelTag {
             "vision" | "image-input" | "image-understanding" => Self::Vision,
             "image" | "image-generation" | "text-to-image" => Self::Image,
             "video" | "video-input" | "video-generation" | "text-to-video" => Self::Video,
-            "speech" | "audio" | "audio-input" | "audio-output" | "asr" | "tts"
-            | "transcription" => Self::Speech,
+            "speech" | "audio" | "audio-input" | "audio-output" | "tts" => Self::Speech,
+            "transcription" | "asr" | "speech-to-text" | "audio-transcription" => {
+                Self::Transcription
+            }
             "embedding" | "embeddings" | "embed" => Self::Embedding,
             "rerank" | "reranking" | "rank" => Self::Rerank,
             _ => return None,
@@ -268,6 +274,7 @@ mod tests {
             ModelTag::Image,
             ModelTag::Video,
             ModelTag::Speech,
+            ModelTag::Transcription,
             ModelTag::Embedding,
             ModelTag::Rerank,
         ] {
@@ -301,6 +308,7 @@ mod tests {
             ModelTag::Image,
             ModelTag::Video,
             ModelTag::Speech,
+            ModelTag::Transcription,
             ModelTag::Embedding,
             ModelTag::Rerank,
         ] {

@@ -209,10 +209,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_or_reserved_prefixes() {
+    fn rejects_malformed_prefixes() {
         assert!(split_route("/tester").is_none());
         assert!(split_route("/").is_none());
         assert!(split_route("/Tester/v1/models").is_none());
-        assert!(split_route("/openai/v1/models").is_none());
+        assert!(split_route(&format!("/{}/v1/models", "x".repeat(66))).is_none());
+    }
+
+    #[test]
+    fn splits_account_prefixes() {
+        let (client, route) = split_route("/u-b_mz/v1/models").unwrap();
+        assert_eq!(client.as_str(), "u-b_mz");
+        assert_eq!(route, "/v1/models");
     }
 }
