@@ -392,11 +392,11 @@ mod tests {
 
     #[test]
     fn replaces_a_deployment_whose_hardware_changed() {
-        let mut wanted = wanted(&[("tester", "m", &[ModelTag::Text])]);
+        let mut wanted = wanted(&[("u-tester", "m", &[ModelTag::Text])]);
         for advertised in wanted.values_mut() {
             advertised.hardware = vec![gb10()];
         }
-        let plan = plan(&wanted, &[row("1", Some("tester/m"), &["text"])]);
+        let plan = plan(&wanted, &[row("1", Some("u-tester/m"), &["text"])]);
         assert_eq!(plan.delete, vec!["1".to_owned()]);
         assert_eq!(plan.create[0].hardware, vec![gb10()]);
     }
