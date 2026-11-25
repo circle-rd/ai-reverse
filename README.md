@@ -44,8 +44,10 @@ flowchart LR
   outbound, initiated by the agent.
 - The agent authorizes itself through the AuthService device flow: a human
   approves a short-lived code in the browser, the refresh token and agent id
-  are persisted with mode 0600, and they are forgotten when the identity
-  provider stops accepting them.
+  are persisted with mode 0600. The credential is forgotten only when the
+  identity provider answers `invalid_grant` (expired, reused or revoked refresh
+  token). Network failures and provider outages keep it and retry with backoff,
+  so a restart during an outage does not require a new approval.
 - The relay verifies AuthService-issued access tokens offline against the
   published JWKS; tokens must carry the relay URL as audience and the
   `tunnel:serve` scope. The relay never issues credentials of its own.
@@ -56,16 +58,19 @@ flowchart LR
 - Tunnels are capped globally (`RELAY_MAX_TUNNELS`) and per account
   (`RELAY_MAX_TUNNELS_PER_USER`); both answer `429` without touching the agent.
 - Only the allowlisted OpenAI routes cross the tunnel (`GET /v1/models`,
-  `POST /v1/{chat/completions,completions,embeddings,embedding,responses,messages}`);
-  queries are never forwarded.
+  `POST /v1/{chat/completions,completions,embeddings,embedding,responses,messages,images/generations,audio/transcriptions,audio/speech}`,
+  and the OpenAI videos surface as LiteLLM proxies it: `/v1/videos`, its `{id}`,
+  `{id}/content` and `{id}/remix`, `edits`, `extensions` and `characters`);
+  realtime websockets and queries are never forwarded.
 - Caller credentials are never forwarded to the engine and the engine key is
   never sent to the relay; the agent injects the engine key itself.
 - The engine key and the agent credential are held in `SecretString` and never
   appear in logs, errors or `Debug` output.
 - A rejected engine key is reported to the caller as a generic `502`; the
   caller cannot tell whether the engine, the key or a model exists.
-- Model ids are validated once at discovery time; LiteLLM provider names and
-  relay path segments are reserved client ids.
+- Model ids are validated once at discovery time. Accounts are always
+  `u-<username>`, a namespace no application slug, LiteLLM provider name or relay
+  path segment can occupy.
 - Request bodies are bounded (64 MiB default) with idle stall guards in both
   directions.
 - The runtime image is `scratch`, non-root (UID/GID 65532), read-only, with no
@@ -100,6 +105,10 @@ docker compose logs -f reverse-agent
 On the first start the agent begins the device flow and prints a verification
 link and a user code; open the link, sign in and approve. The refresh token and
 the agent id are kept in the `agent-state` volume and reused across restarts.
+A restart reuses them without asking for approval; a new approval is needed only
+after the provider rejects the refresh token. The refresh token rotates on each
+renewal and, with the provider's default policy, expires after 30 days without
+use.
 
 Equivalent plain `docker run`:
 
@@ -177,7 +186,7 @@ Plain-text transport to a non-loopback relay is refused unless
 | `RELAY_TUNNEL_LISTEN` | yes | `ip:port` where agents dial the tunnel. |
 | `RELAY_API_LISTEN` | yes | `ip:port` of the OpenAI surface LiteLLM calls; never publish it. |
 | `RELAY_PUBLIC_URL` | yes | Public tunnel origin as agents and the identity provider see it. |
-| `RELAY_PUBLIC_API_BASE` | yes | Origin LiteLLM uses to reach `RELAY_API_LISTEN`; the relay appends `/{account}/…`. |
+| `RELAY_PUBLIC_API_BASE` | yes | Origin LiteLLM uses to reach `RELAY_API_LISTEN`; the relay appends `/{account}/…`, where `{account}` is `u-<username>`. |
 | `RELAY_API_KEY` | yes* | Bearer key LiteLLM presents; injected into registered deployments. |
 | `RELAY_AUTH_ISSUER` | yes | AuthService origin issuing agent tokens. |
 | `RELAY_AUTH_AUDIENCE` | no | Required token audience. Default: `RELAY_PUBLIC_URL`. |
@@ -200,8 +209,18 @@ Plain-text transport to a non-loopback relay is refused unless
 | `RELAY_AUTH_FAILURE_WINDOW_SECS` | no | Window counting failures. Default 60. |
 | `RELAY_AUTH_LOCKOUT_SECS` | no | Initial lockout; doubles up to 8x. Default 60. |
 | `RELAY_TRUST_FORWARDED_FOR` | no | `true`/`false`: trust the last `X-Forwarded-For` entry. Default `false`. |
+| `RELAY_CATALOGUE_CLIENT_ID` | no* | Confidential auth-service client the relay uses to notify model changes; `reverse-relay` when provisioned by the LiteLLM setup. |
+| `RELAY_CATALOGUE_CLIENT_SECRET` | no* | Secret of that client; `_FILE` form accepted. |
 
-`*` Exactly one of the direct and `_FILE` forms is required per secret. Supply
+`*` The two catalogue variables are set together or not at all. Without them the
+relay stays silent and auth-service picks up model changes on its 5-minute sync.
+With them, each change of the served model set is announced to auth-service at
+`RELAY_AUTH_ISSUER` (`POST /api/internal/gateway/inventory-changed`) with a
+`gateway:inventory:sync` client-credentials token, so its model pickers refresh at
+once. The LiteLLM setup of auth-service provisions that client and its scope; the
+`RELAY_AUTH_ISSUER` must be the auth-service `BETTER_AUTH_URL` (the token audience).
+
+Exactly one of the direct and `_FILE` forms is required per secret. Supply
 `RELAY_LITELLM_API_KEY` in production; the master key falls back only for
 bootstrap and logs a warning. Both credentials can manage only deployments
 tagged `model_info.managed_by = "reverse-relay"`.
@@ -260,13 +279,34 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
   `model_info.created_by = "{account}"`, in addition to `client_id` and
   `reverse_name`. This distinguishes models learned by the relay from models
   configured directly in LiteLLM, even when both have the same owner.
-- Changing tags, owner, avatar, author claim or capability flags replaces the
+- Each deployment carries `model_info.hardware`: the self-reported host facts
+  (`kind`, `product`, `vendor`, `gpus`, `memoryMb`, `cpuArch`, `cpuCores`) of the
+  connected agents that serve the model, distinct and ordered by node id. The
+  relay reads them once per tunnel from `/_agent/info`; an agent without that
+  endpoint, or a failed read, publishes no hardware. The facts are not verified:
+  consumers must treat them as declarations, never for billing or authorization.
+- Changing tags, owner, avatar, author claim, capability flags or hardware replaces the
   deployment on the next reconcile: LiteLLM has no partial `model_info` update,
   so the old row is deleted and recreated with the new metadata.
+- The account is `u-` plus the lowercase `preferred_username` of the access
+  token (up to 63 characters, so 65 in total). A token without
+  `preferred_username` is refused; the relay never falls back to `sub`. A user
+  `bmz` therefore publishes `u-bmz/{model}`, which AuthService declares as a
+  resource owned by that user.
 - The relay registers one deployment per `{account}/{model}` alias. Several
   agents of the same account that announce the same model id share that alias
   and are load-balanced by the relay; the deployment stays while at least one
   agent serves it and is removed after the grace period once none does.
+
+### Upgrading to `u-<username>` accounts
+
+Before this change the account was the bare username (`bmz/{model}`). On the
+next tunnel after the relay upgrade, reconcile deletes the `bmz/…` deployments
+and creates the `u-bmz/…` ones, so the models are briefly unavailable and
+clients must switch to the new names. The AuthService objects, links and
+resources recorded for the old names become stale and are purged on the
+AuthService side. Agents need no change: they never know the account, which the
+relay derives from the device-grant token.
 
 Tags: `text`, `tools`, `vision`, `image`, `video`, `speech`, `embedding`,
 `rerank`.

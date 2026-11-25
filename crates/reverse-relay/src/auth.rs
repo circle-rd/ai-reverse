@@ -42,6 +42,9 @@ pub enum AuthError {
     /// The identity provider could not be reached or answered nonsense.
     #[error("identity provider failure: {0}")]
     Provider(String),
+    /// The token carries no `preferred_username`, so no account can be derived.
+    #[error("token has no preferred_username")]
+    MissingUsername,
     /// The account name cannot be used as a model prefix.
     #[error("invalid account name: {0}")]
     Account(String),
@@ -52,8 +55,8 @@ pub enum AuthError {
 pub struct Identity {
     /// Immutable subject id.
     pub sub: String,
-    /// Model-alias prefix derived from the account name.
-    pub username: ClientId,
+    /// Model-alias prefix: `u-` plus the lowercase `preferred_username`.
+    pub account: ClientId,
     /// Stable per-agent instance id.
     pub agent_id: AgentId,
 }
@@ -180,16 +183,10 @@ impl AuthState {
         if !granted.split(' ').any(|scope| scope == self.scope) {
             return Err(AuthError::MissingScope);
         }
-        let raw = claims
-            .preferred_username
-            .as_deref()
-            .unwrap_or(claims.sub.as_str())
-            .to_ascii_lowercase();
-        let username =
-            ClientId::parse(&raw).map_err(|error| AuthError::Account(error.to_string()))?;
+        let account = account_of(claims.preferred_username.as_deref())?;
         Ok(Identity {
             sub: claims.sub,
-            username,
+            account,
             agent_id,
         })
     }
@@ -298,6 +295,11 @@ impl AuthState {
         tracing::debug!(count = keys.len(), "auth.keys_refreshed");
         Ok(keys)
     }
+}
+
+fn account_of(preferred_username: Option<&str>) -> Result<ClientId, AuthError> {
+    let username = preferred_username.ok_or(AuthError::MissingUsername)?;
+    ClientId::account(username).map_err(|error| AuthError::Account(error.to_string()))
 }
 
 fn lock(cache: &Mutex<Cache>) -> MutexGuard<'_, Cache> {
@@ -418,6 +420,27 @@ mod tests {
             assert!(allowed_algorithm(algorithm).is_ok());
         }
         assert!(allowed_algorithm(jsonwebtoken::Algorithm::HS256).is_err());
+    }
+
+    #[test]
+    fn the_account_is_the_lowercase_username_under_the_u_prefix() {
+        assert_eq!(account_of(Some("Bmz")).unwrap().as_str(), "u-bmz");
+    }
+
+    #[test]
+    fn a_token_without_a_username_is_refused() {
+        assert!(matches!(account_of(None), Err(AuthError::MissingUsername)));
+        assert!(matches!(account_of(Some("")), Err(AuthError::Account(_))));
+    }
+
+    #[test]
+    fn a_username_that_cannot_prefix_a_model_is_refused() {
+        for name in ["a/b", "a b", &"x".repeat(64)] {
+            assert!(
+                matches!(account_of(Some(name)), Err(AuthError::Account(_))),
+                "{name}"
+            );
+        }
     }
 
     #[test]

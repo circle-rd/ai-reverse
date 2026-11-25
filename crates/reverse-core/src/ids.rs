@@ -5,56 +5,13 @@ use std::fmt;
 use thiserror::Error;
 
 const MIN_CLIENT_ID_LEN: usize = 2;
-const MAX_CLIENT_ID_LEN: usize = 63;
+const MAX_CLIENT_ID_LEN: usize = 65;
 const MAX_MODEL_NAME_LEN: usize = 128;
+/// Namespace of user-owned resources; application slugs can never start with it, so an account
+/// cannot collide with an application, a LiteLLM provider name or a relay path.
+const ACCOUNT_PREFIX: &str = "u-";
 /// Length of the hex-encoded agent id agents present when opening a tunnel.
 pub const AGENT_ID_LEN: usize = 16;
-
-/// LiteLLM parses `provider/model` prefixes, so a client id equal to a provider name could be
-/// routed to that provider; the last three collide with relay paths.
-const RESERVED_CLIENT_IDS: &[&str] = &[
-    "anthropic",
-    "azure",
-    "azure_ai",
-    "bedrock",
-    "cloudflare",
-    "cohere",
-    "custom_openai",
-    "databricks",
-    "deepseek",
-    "fireworks_ai",
-    "gemini",
-    "github",
-    "google",
-    "groq",
-    "hosted_vllm",
-    "huggingface",
-    "jina_ai",
-    "litellm",
-    "litellm_proxy",
-    "lm_studio",
-    "mistral",
-    "nvidia_nim",
-    "ollama",
-    "ollama_chat",
-    "openai",
-    "openai_like",
-    "openrouter",
-    "perplexity",
-    "replicate",
-    "sagemaker",
-    "snowflake",
-    "text-completion-openai",
-    "together_ai",
-    "vertex_ai",
-    "vllm",
-    "voyage",
-    "watsonx",
-    "xai",
-    "healthz",
-    "tunnel",
-    "v1",
-];
 
 /// Why an identifier was rejected.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -65,9 +22,9 @@ pub enum IdError {
     /// The client id contains a forbidden character.
     #[error("client id must match [a-z0-9][a-z0-9_-]*")]
     ClientIdCharset,
-    /// The client id collides with a name LiteLLM or the relay interprets.
-    #[error("client id is reserved")]
-    ClientIdReserved,
+    /// The account name is empty.
+    #[error("account name must not be empty")]
+    AccountNameEmpty,
     /// The model name is empty or too long.
     #[error("model name must be 1 to {MAX_MODEL_NAME_LEN} characters")]
     ModelNameLength,
@@ -101,10 +58,18 @@ impl ClientId {
         if !starts_ok || !rest_ok {
             return Err(IdError::ClientIdCharset);
         }
-        if RESERVED_CLIENT_IDS.contains(&raw) {
-            return Err(IdError::ClientIdReserved);
-        }
         Ok(Self(raw.to_owned()))
+    }
+
+    /// The client id of a user account: `u-` plus the lowercase account name.
+    pub fn account(username: &str) -> Result<Self, IdError> {
+        if username.is_empty() {
+            return Err(IdError::AccountNameEmpty);
+        }
+        Self::parse(&format!(
+            "{ACCOUNT_PREFIX}{}",
+            username.to_ascii_lowercase()
+        ))
     }
 
     /// The validated identifier.
@@ -199,7 +164,7 @@ mod tests {
 
     #[test]
     fn accepts_plain_client_ids() {
-        for id in ["tester", "ab", "a1_b-2", "x".repeat(63).as_str()] {
+        for id in ["tester", "ab", "a1_b-2", "x".repeat(65).as_str()] {
             assert!(ClientId::parse(id).is_ok(), "{id}");
         }
     }
@@ -208,7 +173,7 @@ mod tests {
     fn rejects_bad_client_ids() {
         assert_eq!(ClientId::parse("a"), Err(IdError::ClientIdLength));
         assert_eq!(
-            ClientId::parse(&"x".repeat(64)),
+            ClientId::parse(&"x".repeat(66)),
             Err(IdError::ClientIdLength)
         );
         assert_eq!(ClientId::parse("Tester"), Err(IdError::ClientIdCharset));
@@ -218,9 +183,77 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reserved_client_ids() {
-        for id in ["openai", "hosted_vllm", "healthz", "v1"] {
-            assert_eq!(ClientId::parse(id), Err(IdError::ClientIdReserved), "{id}");
+    fn accounts_are_the_lowercase_username_under_the_u_prefix() {
+        assert_eq!(ClientId::account("Bmz").unwrap().as_str(), "u-bmz");
+        assert_eq!(ClientId::account("a_b-1").unwrap().as_str(), "u-a_b-1");
+        assert!(ClientId::account(&"x".repeat(63)).is_ok());
+    }
+
+    #[test]
+    fn rejects_unusable_account_names() {
+        assert_eq!(ClientId::account(""), Err(IdError::AccountNameEmpty));
+        assert_eq!(
+            ClientId::account(&"x".repeat(64)),
+            Err(IdError::ClientIdLength)
+        );
+        for name in ["a/b", "a b", "é"] {
+            assert_eq!(
+                ClientId::account(name),
+                Err(IdError::ClientIdCharset),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_account_never_equals_a_provider_name_or_a_relay_path() {
+        // LiteLLM routes a `provider/model` prefix to that provider; the last three are relay paths.
+        let taken = [
+            "anthropic",
+            "azure",
+            "azure_ai",
+            "bedrock",
+            "cloudflare",
+            "cohere",
+            "custom_openai",
+            "databricks",
+            "deepseek",
+            "fireworks_ai",
+            "gemini",
+            "github",
+            "google",
+            "groq",
+            "hosted_vllm",
+            "huggingface",
+            "jina_ai",
+            "litellm",
+            "litellm_proxy",
+            "lm_studio",
+            "mistral",
+            "nvidia_nim",
+            "ollama",
+            "ollama_chat",
+            "openai",
+            "openai_like",
+            "openrouter",
+            "perplexity",
+            "replicate",
+            "sagemaker",
+            "snowflake",
+            "text-completion-openai",
+            "together_ai",
+            "vertex_ai",
+            "vllm",
+            "voyage",
+            "watsonx",
+            "xai",
+            "healthz",
+            "tunnel",
+            "v1",
+        ];
+        for name in taken {
+            assert!(!name.starts_with(ACCOUNT_PREFIX), "{name}");
+            assert_ne!(ClientId::account(name).unwrap().as_str(), name);
         }
     }
 

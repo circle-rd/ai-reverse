@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use reqwest::{Client, Method, RequestBuilder, Url, redirect};
 use reverse_core::ids::{ClientId, ModelName};
 use reverse_core::secret::SecretString;
-use reverse_core::wire::{AuthorSafetyClaim, ModelMetadata, ModelTag};
+use reverse_core::wire::{AuthorSafetyClaim, HardwareInfo, ModelMetadata, ModelTag};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -32,6 +32,8 @@ pub struct Managed {
     pub mode: Option<String>,
     /// Capability flags recorded in `model_info`.
     pub supports: Supports,
+    /// Hardware of the nodes serving the model, as recorded in `model_info`; empty when absent.
+    pub hardware: Vec<HardwareInfo>,
 }
 
 /// Capability flags this relay publishes in `model_info`.
@@ -54,16 +56,26 @@ pub(crate) struct Publish {
 impl Publish {
     pub(crate) fn from_tags(tags: &[ModelTag]) -> Self {
         let has = |tag| tags.contains(&tag);
-        // Only embedding has a distinct routing mode on the routes the relay serves;
-        // image and rerank models are still tagged but stay on the chat surface.
-        let mode = has(ModelTag::Embedding).then_some("embedding");
+        // LiteLLM's mode names the endpoint family a deployment serves. One speech lane answers
+        // both recognition and synthesis, so it keeps the chat surface and its audio flags.
+        let mode = if has(ModelTag::Embedding) {
+            Some("embedding")
+        } else if has(ModelTag::Image) {
+            Some("image_generation")
+        } else if has(ModelTag::Transcription) {
+            Some("audio_transcription")
+        } else if has(ModelTag::Video) {
+            Some("video_generation")
+        } else {
+            None
+        };
         Self {
             mode,
             supports: Supports {
                 function_calling: has(ModelTag::Tools),
                 vision: has(ModelTag::Vision),
                 video_input: has(ModelTag::Video),
-                audio_input: has(ModelTag::Speech),
+                audio_input: has(ModelTag::Speech) || has(ModelTag::Transcription),
                 audio_output: has(ModelTag::Speech),
             },
         }
@@ -78,6 +90,37 @@ struct ModelInfoList {
 #[derive(Deserialize)]
 struct Row {
     model_info: Option<RowInfo>,
+}
+
+/// The deployments this relay owns, one per deployment id.
+fn managed_rows(list: ModelInfoList) -> Vec<Managed> {
+    let mut seen = HashSet::new();
+    list.data
+        .into_iter()
+        .filter_map(|row| row.model_info)
+        .filter(|info| info.managed_by.as_deref() == Some(MANAGED_BY))
+        .filter_map(|info| {
+            let id = info.id?;
+            seen.insert(id.clone()).then_some(Managed {
+                id,
+                reverse_name: info.reverse_name,
+                created_by: info.created_by,
+                tags: info.tags,
+                hub_owner: info.hub_owner,
+                hub_avatar_url: info.hub_avatar_url,
+                author_safety_claim: info.author_safety_claim,
+                mode: info.mode,
+                supports: Supports {
+                    function_calling: info.supports_function_calling,
+                    vision: info.supports_vision,
+                    video_input: info.supports_video_input,
+                    audio_input: info.supports_audio_input,
+                    audio_output: info.supports_audio_output,
+                },
+                hardware: info.hardware.unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 /// LiteLLM persists a capability flag we omit as JSON `null` rather than dropping
@@ -95,6 +138,8 @@ struct RowInfo {
     mode: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    hardware: Option<Vec<HardwareInfo>>,
     #[serde(default)]
     hub_owner: Option<String>,
     #[serde(default)]
@@ -140,6 +185,8 @@ struct NewModelInfo<'a> {
     hub_avatar_url: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     author_safety_claim: Option<AuthorSafetyClaim>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hardware: Option<&'a [HardwareInfo]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -212,33 +259,7 @@ impl LiteLlm {
     pub async fn list_managed(&self) -> Result<Vec<Managed>, LiteLlmError> {
         let response = Self::send(self.request(Method::GET, "model/info")?).await?;
         let list: ModelInfoList = response.json().await?;
-        let mut seen = HashSet::new();
-        Ok(list
-            .data
-            .into_iter()
-            .filter_map(|row| row.model_info)
-            .filter(|info| info.managed_by.as_deref() == Some(MANAGED_BY))
-            .filter_map(|info| {
-                let id = info.id?;
-                seen.insert(id.clone()).then_some(Managed {
-                    id,
-                    reverse_name: info.reverse_name,
-                    created_by: info.created_by,
-                    tags: info.tags,
-                    hub_owner: info.hub_owner,
-                    hub_avatar_url: info.hub_avatar_url,
-                    author_safety_claim: info.author_safety_claim,
-                    mode: info.mode,
-                    supports: Supports {
-                        function_calling: info.supports_function_calling,
-                        vision: info.supports_vision,
-                        video_input: info.supports_video_input,
-                        audio_input: info.supports_audio_input,
-                        audio_output: info.supports_audio_output,
-                    },
-                })
-            })
-            .collect())
+        Ok(managed_rows(list))
     }
 
     /// Registers `{client}/{model}` as an OpenAI-compatible deployment served by the relay.
@@ -247,6 +268,7 @@ impl LiteLlm {
         client: &ClientId,
         model: &ModelName,
         metadata: &ModelMetadata,
+        hardware: &[HardwareInfo],
     ) -> Result<(), LiteLlmError> {
         let name = format!("{client}/{model}");
         let publish = Publish::from_tags(&metadata.tags);
@@ -266,6 +288,7 @@ impl LiteLlm {
                 hub_owner: metadata.hub_owner.as_deref(),
                 hub_avatar_url: metadata.hub_avatar_url.as_deref(),
                 author_safety_claim: metadata.author_safety_claim,
+                hardware: (!hardware.is_empty()).then_some(hardware),
                 mode: publish.mode,
                 supports_function_calling: publish.supports.function_calling.then_some(true),
                 supports_vision: publish.supports.vision.then_some(true),
@@ -292,46 +315,69 @@ impl LiteLlm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reverse_core::wire::HardwareKind;
 
     #[test]
     fn parses_flags_litellm_persisted_as_null() {
         // LiteLLM stores omitted capability flags as JSON null, not as absent keys.
         let list: ModelInfoList = serde_json::from_str(
-            r#"{"data":[{"model_info":{"id":"1","managed_by":"reverse-relay","reverse_name":"bmz/m","created_by":"bmz","tags":["text"],"supports_function_calling":true,"supports_vision":null,"supports_video_input":null,"supports_audio_input":null,"supports_audio_output":null}}]}"#,
+            r#"{"data":[{"model_info":{"id":"1","managed_by":"reverse-relay","reverse_name":"u-bmz/m","created_by":"u-bmz","tags":["text"],"supports_function_calling":true,"supports_vision":null,"supports_video_input":null,"supports_audio_input":null,"supports_audio_output":null}}]}"#,
         )
         .expect("a row with null flags");
-        let managed = list_managed_rows(&list);
+        let managed = managed_rows(list);
         assert_eq!(managed.len(), 1);
         assert!(managed[0].supports.function_calling);
         assert!(!managed[0].supports.vision);
+        assert!(managed[0].hardware.is_empty());
     }
 
-    fn list_managed_rows(list: &ModelInfoList) -> Vec<Managed> {
-        let mut seen = HashSet::new();
-        list.data
-            .iter()
-            .filter_map(|row| row.model_info.as_ref())
-            .filter(|info| info.managed_by.as_deref() == Some(MANAGED_BY))
-            .filter_map(|info| {
-                let id = info.id.as_ref()?;
-                seen.insert(id.clone()).then_some(Managed {
-                    id: id.clone(),
-                    reverse_name: info.reverse_name.clone(),
-                    created_by: info.created_by.clone(),
-                    tags: info.tags.clone(),
-                    hub_owner: info.hub_owner.clone(),
-                    hub_avatar_url: info.hub_avatar_url.clone(),
-                    author_safety_claim: info.author_safety_claim,
-                    mode: info.mode.clone(),
-                    supports: Supports {
-                        function_calling: info.supports_function_calling,
-                        vision: info.supports_vision,
-                        video_input: info.supports_video_input,
-                        audio_input: info.supports_audio_input,
-                        audio_output: info.supports_audio_output,
-                    },
-                })
-            })
-            .collect()
+    #[test]
+    fn reads_the_hardware_recorded_on_a_deployment() {
+        let list: ModelInfoList = serde_json::from_str(
+            r#"{"data":[{"model_info":{"id":"1","managed_by":"reverse-relay","reverse_name":"bmz/m","hardware":[{"kind":"dgx-spark","product":"NVIDIA DGX Spark","vendor":null,"gpus":["NVIDIA GB10"],"memoryMb":122880,"cpuArch":"aarch64","cpuCores":20}]}}]}"#,
+        )
+        .expect("a row with hardware");
+        let managed = managed_rows(list);
+        assert_eq!(managed[0].hardware.len(), 1);
+        assert_eq!(managed[0].hardware[0].kind, HardwareKind::DgxSpark);
+        assert_eq!(managed[0].hardware[0].cpu_cores, 20);
+    }
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+
+    #[test]
+    fn each_media_tag_names_its_litellm_endpoint_family() {
+        assert_eq!(
+            Publish::from_tags(&[ModelTag::Embedding]).mode,
+            Some("embedding")
+        );
+        assert_eq!(
+            Publish::from_tags(&[ModelTag::Image]).mode,
+            Some("image_generation")
+        );
+        assert_eq!(
+            Publish::from_tags(&[ModelTag::Transcription]).mode,
+            Some("audio_transcription")
+        );
+        assert_eq!(
+            Publish::from_tags(&[ModelTag::Video]).mode,
+            Some("video_generation")
+        );
+        assert_eq!(
+            Publish::from_tags(&[ModelTag::Text, ModelTag::Tools]).mode,
+            None
+        );
+    }
+
+    #[test]
+    fn a_speech_model_keeps_the_chat_surface_and_its_audio_flags() {
+        let speech = Publish::from_tags(&[ModelTag::Speech]);
+        assert_eq!(speech.mode, None);
+        assert!(speech.supports.audio_input && speech.supports.audio_output);
+        let asr = Publish::from_tags(&[ModelTag::Transcription]);
+        assert!(asr.supports.audio_input && !asr.supports.audio_output);
     }
 }

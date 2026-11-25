@@ -10,6 +10,15 @@ use reverse_core::secret::SecretString;
 const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_AUTH_SCOPE: &str = "tunnel:serve";
 
+/// The client the relay authenticates as when it tells auth-service the models changed.
+#[derive(Debug, Clone)]
+pub struct CatalogueCredentials {
+    /// Confidential client id registered in auth-service.
+    pub client_id: String,
+    /// Client secret, from `RELAY_CATALOGUE_CLIENT_SECRET` or its `_FILE` form.
+    pub client_secret: SecretString,
+}
+
 /// Everything the relay needs, validated at startup.
 #[derive(Debug)]
 pub struct Config {
@@ -65,6 +74,8 @@ pub struct Config {
     pub auth_lockout: Duration,
     /// Whether the last `X-Forwarded-For` entry is the client address (a proxy sits in front).
     pub trust_forwarded_for: bool,
+    /// Credentials for the catalogue notification; `None` leaves auth-service to its own sync.
+    pub catalogue: Option<CatalogueCredentials>,
 }
 
 impl Config {
@@ -138,7 +149,34 @@ impl Config {
             auth_failure_window: env.duration_secs("RELAY_AUTH_FAILURE_WINDOW_SECS", 60)?,
             auth_lockout: env.duration_secs("RELAY_AUTH_LOCKOUT_SECS", 60)?,
             trust_forwarded_for: env.flag("RELAY_TRUST_FORWARDED_FOR")?,
+            catalogue: catalogue_credentials(env)?,
         })
+    }
+}
+
+fn catalogue_credentials<F: Fn(&str) -> Option<String>>(
+    env: &Env<F>,
+) -> Result<Option<CatalogueCredentials>, ConfigError> {
+    let client_id = env.optional("RELAY_CATALOGUE_CLIENT_ID")?;
+    let client_secret = env.secret("RELAY_CATALOGUE_CLIENT_SECRET")?;
+    match (client_id, client_secret) {
+        (None, None) => Ok(None),
+        (Some(client_id), Some(client_secret)) => {
+            if client_id.trim().is_empty() {
+                return Err(ConfigError::invalid(
+                    "RELAY_CATALOGUE_CLIENT_ID",
+                    "must not be empty",
+                ));
+            }
+            Ok(Some(CatalogueCredentials {
+                client_id: client_id.trim().to_owned(),
+                client_secret,
+            }))
+        }
+        _ => Err(ConfigError::invalid(
+            "RELAY_CATALOGUE_CLIENT_ID",
+            "RELAY_CATALOGUE_CLIENT_ID and RELAY_CATALOGUE_CLIENT_SECRET must be set together",
+        )),
     }
 }
 
@@ -267,6 +305,55 @@ mod tests {
         assert_eq!(cfg.auth_failure_threshold, 5);
         assert_eq!(cfg.auth_failure_window, Duration::from_secs(60));
         assert_eq!(cfg.auth_lockout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn catalogue_notification_is_off_without_credentials() {
+        assert!(load(&BASE).unwrap().catalogue.is_none());
+    }
+
+    #[test]
+    fn catalogue_notification_reads_the_client_secret_from_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret");
+        std::fs::write(&file, "relay-secret\n").unwrap();
+        let file = file.display().to_string();
+        let pairs: Vec<_> = BASE
+            .iter()
+            .copied()
+            .chain([
+                ("RELAY_CATALOGUE_CLIENT_ID", "reverse-relay"),
+                ("RELAY_CATALOGUE_CLIENT_SECRET_FILE", file.as_str()),
+            ])
+            .collect();
+        let credentials = load(&pairs).unwrap().catalogue.unwrap();
+        assert_eq!(credentials.client_id, "reverse-relay");
+        assert_eq!(credentials.client_secret.expose(), "relay-secret");
+    }
+
+    #[test]
+    fn catalogue_credentials_are_all_or_nothing() {
+        let id_only: Vec<_> = BASE
+            .iter()
+            .copied()
+            .chain([("RELAY_CATALOGUE_CLIENT_ID", "reverse-relay")])
+            .collect();
+        assert!(load(&id_only).is_err());
+        let secret_only: Vec<_> = BASE
+            .iter()
+            .copied()
+            .chain([("RELAY_CATALOGUE_CLIENT_SECRET", "relay-secret")])
+            .collect();
+        assert!(load(&secret_only).is_err());
+        let blank_id: Vec<_> = BASE
+            .iter()
+            .copied()
+            .chain([
+                ("RELAY_CATALOGUE_CLIENT_ID", "  "),
+                ("RELAY_CATALOGUE_CLIENT_SECRET", "relay-secret"),
+            ])
+            .collect();
+        assert!(load(&blank_id).is_err());
     }
 
     #[test]

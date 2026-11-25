@@ -203,9 +203,11 @@ must be written in English.** No exceptions.
   before entering the snapshot; rejected ids are logged and dropped.
 - Announced models are the union of the engine's `/v1/models` and
   `AGENT_EXTRA_MODELS`, deduplicated and sorted.
-- Model aliases are per account (`{preferred_username}/{model}`); agents of the
-  same account that announce the same id share one deployment and are pooled by
-  the relay, while distinct ids remain distinct aliases.
+- Model aliases are per account (`{account}/{model}`); the account is `u-` plus the
+  lowercase `preferred_username`, and a token without it is refused, never replaced
+  by `sub`. Agents of the same account that announce the same id share one
+  deployment and are pooled by the relay, while distinct ids remain distinct
+  aliases.
 - Capability tags resolve in one order: `AGENT_MODEL_TAGS` (operator), then the
   hub's `pipeline_tag` mapped in `catalog.rs`, then no tag. Never infer tags
   from the model name: names are not a stable classification and new families
@@ -214,8 +216,9 @@ must be written in English.** No exceptions.
   negative cache, one bounded pass per discovery cycle so a slow hub cannot
   postpone the announcement of newly discovered models, `AGENT_HF_METADATA=false`
   for air-gapped boxes, and no effect on serving when they fail.
-- Client ids and reserved prefixes are validated by `reverse_core::ids`; the
-  reserved list exists because LiteLLM parses `provider/model` prefixes.
+- Client ids are validated by `reverse_core::ids` (2 to 65 characters). The `u-`
+  prefix keeps an account from equalling a LiteLLM provider name (LiteLLM parses
+  `provider/model` prefixes), an application slug or a relay path; no reserved list.
 - The tunnel protocol token is checked on upgrade; a mismatched `Upgrade`
   header is a protocol error, not a fallback.
 
@@ -255,7 +258,7 @@ The blocking gates are the steps `.github/workflows/ci.yml` runs:
 crates/
 ├── reverse-core/                # shared library, no transport
 │   ├── src/wire.rs              # tunnel protocol constants, snapshot/info models
-│   ├── src/ids.rs               # ModelName, ClientId validation, reserved prefixes
+│   ├── src/ids.rs               # ModelName, ClientId and account validation
 │   ├── src/config.rs            # Env reader, BaseUrl, ConfigError (parse once)
 │   ├── src/secret.rs            # SecretString
 │   ├── src/body.rs              # bounded, cancellable proxy bodies
@@ -295,7 +298,7 @@ crates/
 | Module | Responsibility | Must NOT contain |
 | --- | --- | --- |
 | `reverse-core/wire.rs` | Protocol constants and wire models | transport code |
-| `reverse-core/ids.rs` | Identifier validation and reserved names | routing |
+| `reverse-core/ids.rs` | Identifier validation and account naming | routing |
 | `reverse-core/config.rs` | Environment parsing primitives | agent or relay policy |
 | `reverse-core/forward.rs` | Tunnel allowlist: routes, headers, error shapes | engine specifics |
 | `reverse-agent/config.rs` | `AGENT_*` validation, typed `Config` | protocol logic |
@@ -382,8 +385,8 @@ private helpers.
   attempts are counted per client address in bounded state, locked out with a
   `Retry-After` after a threshold, with lockouts doubling and expiring.
 - Tunnels are capped globally and per account; both answer `429`.
-- Only the routes allowlisted in `reverse_core::forward` cross the tunnel;
-  queries are never forwarded; only `content-type`, `content-length`, `accept`
+- Only the routes allowlisted in `reverse_core::forward` cross the tunnel (chat, embeddings,
+  images, audio and the OpenAI videos surface as LiteLLM proxies it); queries are never forwarded; only `content-type`, `content-length`, `accept`
   and `x-request-id` request headers are forwarded.
 - The caller's `Authorization` and `Cookie` are never forwarded; the engine key
   is added by the agent and never leaves it.
@@ -425,7 +428,7 @@ private helpers.
 - `README.md` is the operator entrypoint: quickstart with `docker compose pull`
   and env files, configuration tables, security properties, limitations.
 - The wire contract lives in `crates/reverse-core/src/wire.rs`; identifier rules
-  (including reserved client ids) live in `crates/reverse-core/src/ids.rs`.
+  (including the `u-` account namespace) live in `crates/reverse-core/src/ids.rs`.
   Update them, their tests and the README in the same change.
 - User-visible behavior changes need tests and documentation in the same change.
 - Release tags are `v*`; both images (agent and relay) publish `nightly` from

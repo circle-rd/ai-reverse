@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use http::{Method, Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use serde::Serialize;
@@ -70,9 +70,16 @@ pub struct FakeIdp {
     pub username: String,
     /// Audience every token carries.
     pub audience: String,
+    notified: Arc<AtomicU32>,
 }
 
 impl FakeIdp {
+    /// Inventory-changed notifications accepted from the relay so far.
+    #[must_use]
+    pub fn notifications(&self) -> u32 {
+        self.notified.load(Ordering::Relaxed)
+    }
+
     /// Mints an access token with explicit audience and scope, for rejection tests.
     #[must_use]
     pub fn token(&self, audience: &str, scope: &str) -> String {
@@ -92,15 +99,18 @@ impl FakeIdp {
         let username = username.to_owned();
         let audience = audience.to_owned();
         let counter = Arc::new(AtomicU32::new(0));
+        let notified = Arc::new(AtomicU32::new(0));
         let handler = {
             let base = base.clone();
             let username = username.clone();
             let audience = audience.clone();
+            let notified = notified.clone();
             move |request: Request<Incoming>| {
                 let base = base.clone();
                 let username = username.clone();
                 let audience = audience.clone();
                 let counter = counter.clone();
+                let notified = notified.clone();
                 async move {
                     let (parts, body) = request.into_parts();
                     let bytes = body
@@ -108,6 +118,10 @@ impl FakeIdp {
                         .await
                         .map_or_else(|_| Default::default(), |b| b.to_bytes());
                     let form = String::from_utf8_lossy(&bytes).to_string();
+                    let authorized = parts
+                        .headers
+                        .get(header::AUTHORIZATION)
+                        .is_some_and(|value| value.as_bytes().starts_with(b"Bearer "));
                     let reply = match (parts.method, parts.uri.path()) {
                         (Method::GET, "/.well-known/openid-configuration") => json_reply(json!({
                             "issuer": base,
@@ -159,6 +173,31 @@ impl FakeIdp {
                                 "token_type": "Bearer",
                             }))
                         }
+                        (Method::POST, "/token") if form.contains("client_credentials") => {
+                            json_reply(json!({
+                                "access_token": access_token(
+                                    &base,
+                                    &username,
+                                    &audience,
+                                    "gateway:inventory:sync",
+                                ),
+                                "token_type": "Bearer",
+                            }))
+                        }
+                        (Method::POST, "/api/internal/gateway/inventory-changed") => {
+                            if authorized {
+                                notified.fetch_add(1, Ordering::Relaxed);
+                                Response::builder()
+                                    .status(StatusCode::ACCEPTED)
+                                    .body(Full::new(bytes::Bytes::new()).boxed())
+                                    .unwrap()
+                            } else {
+                                Response::builder()
+                                    .status(StatusCode::UNAUTHORIZED)
+                                    .body(Full::new(bytes::Bytes::new()).boxed())
+                                    .unwrap()
+                            }
+                        }
                         _ => Response::builder()
                             .status(StatusCode::NOT_FOUND)
                             .body(Full::new(bytes::Bytes::new()).boxed())
@@ -173,6 +212,7 @@ impl FakeIdp {
             addr,
             username,
             audience,
+            notified,
         }
     }
 }
