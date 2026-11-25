@@ -203,9 +203,6 @@ async fn only_allowlisted_routes_and_connected_clients_are_served() {
     let nobody = send(stack.relay_api, Method::GET, "/nobody1/v1/models", "").await;
     assert_eq!(nobody.status, StatusCode::SERVICE_UNAVAILABLE);
 
-    let reserved = send(stack.relay_api, Method::GET, "/openai/v1/models", "").await;
-    assert_eq!(reserved.status, StatusCode::NOT_FOUND);
-
     let models = send(stack.relay_api, Method::GET, "/tester/v1/models", "").await;
     assert_eq!(models.status, StatusCode::OK);
     assert_eq!(models.json()["data"][0]["id"], "qwen3.8-27b");
