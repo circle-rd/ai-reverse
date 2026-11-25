@@ -30,7 +30,7 @@ on pushes to `main` and `develop`.
 
 The agent/relay wire contract lives in `crates/reverse-core/src/wire.rs` and the
 validated identifier rules in `crates/reverse-core/src/ids.rs`. When the wire
-contract or the reserved identifier list changes, update the shared types, the
+contract or the identifier rules change, update the shared types, the
 agent tests and this documentation in the same change.
 
 ## Local validation workspace
