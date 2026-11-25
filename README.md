@@ -215,6 +215,10 @@ Plain-text transport to a non-loopback relay is refused unless
 | `RELAY_TRUST_FORWARDED_FOR` | no | `true`/`false`: trust the last `X-Forwarded-For` entry. Default `false`. |
 | `RELAY_CATALOGUE_CLIENT_ID` | no* | Confidential auth-service client the relay uses to notify model changes; `reverse-relay` when provisioned by the LiteLLM setup. |
 | `RELAY_CATALOGUE_CLIENT_SECRET` | no* | Secret of that client; `_FILE` form accepted. |
+| `RELAY_INVENTORY_URL` | no | HTTPS endpoint that receives the inventory and answers with the owners' settings (see "Owner settings"). Set with the next two or none. |
+| `RELAY_INVENTORY_SECRET` | no* | Shared secret that signs each push; `_FILE` form accepted. |
+| `RELAY_INVENTORY_RELAY_ID` | no* | Names this relay: 1 to 63 lowercase letters, digits or dashes. |
+| `RELAY_INVENTORY_INTERVAL_SECS` | no | Interval between pushes, which is also the heartbeat of the live status. Default 15. |
 
 `*` The two catalogue variables are set together or not at all. Without them the
 relay stays silent and auth-service picks up model changes on its 5-minute sync.
@@ -228,6 +232,41 @@ Exactly one of the direct and `_FILE` forms is required per secret. Supply
 `RELAY_LITELLM_API_KEY` in production; the master key falls back only for
 bootstrap and logs a warning. Both credentials can manage only deployments
 tagged `model_info.managed_by = "reverse-relay"`.
+
+## Owner settings: price and parallel requests
+
+The relay keeps no durable state, so the owner's decisions live with the application
+that owns them (raiversed). With `RELAY_INVENTORY_URL` set, the relay polls each agent's
+`/_agent/status` and every `RELAY_INVENTORY_INTERVAL_SECS` pushes one signed snapshot of
+everything connected; the answer carries the settings of the models in it.
+
+- **Push.** `POST` of `{ relayId, generatedAt, nodes[] }` (`generatedAt` is Unix
+  milliseconds and never goes backwards). Each node has `nodeId` (the agent instance id),
+  `ownerSub`, `ownerName` (`u-<username>`), `hardware`, `status` and `models[]`
+  (`{ name, tags }`). A node absent from a snapshot is offline; on shutdown the relay
+  pushes one last snapshot with no node. No IP address or hostname is sent. The header
+  `x-relay-signature: t=<unix seconds>,v1=<hex>` is the HMAC-SHA256 of `<t>.<body>`
+  with the shared secret; the receiver checks it in constant time and refuses an old `t`.
+- **Answer.** `200` with `{ "settings": [{ "model": "u-<user>/<model>", "maxSlots": 4,
+  "pricing": { "inputUsdPerMtok": "0.30", "outputUsdPerMtok": "1.20",
+  "cacheReadUsdPerMtok": null, "cacheWriteUsdPerMtok": null } }] }`. Prices are plain
+  decimal strings in **US dollars per million tokens** (at most 6 decimals); `maxSlots` is
+  1 to 100000. The answer is authoritative: a model absent from it has no settings, so it
+  is served unpriced and unlimited, and a price of `"0"` serves it free on purpose.
+- **Applied to LiteLLM.** `litellm_params.max_parallel_requests`, and the costs per token
+  (`input_cost_per_token`, `output_cost_per_token`, `cache_read_input_token_cost`,
+  `cache_creation_input_token_cost`) in both `litellm_params` (routing) and `model_info`
+  (billing), plus the settings as received in `model_info.reverse_settings`. A change
+  replaces the deployment, like any change of `model_info`.
+- **Fail loud.** An answer that is not `200`, is not valid JSON, holds one invalid price or
+  slot limit, or names a model twice is refused whole and the relay keeps the settings it
+  had; it never drops one entry and serves that model unpriced. If the receiver stays
+  unreachable the last settings stay in force, and a restarted relay serves unpriced
+  until the first answer.
+- **Parallel requests.** LiteLLM counts `max_parallel_requests` per proxy worker, not
+  across workers or pods; a request over it is refused at once with a 429 and fails over
+  to another deployment of the model group in current releases, while older ones queued.
+  Check the behaviour of the LiteLLM version you run.
 
 ## Model announcement and tags
 

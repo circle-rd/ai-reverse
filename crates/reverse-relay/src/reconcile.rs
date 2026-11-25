@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reverse_core::ids::{ClientId, ModelName};
+use reverse_core::inventory::ModelSettings;
 use reverse_core::shutdown::triggered;
 use reverse_core::wire::{HardwareInfo, ModelMetadata};
 use tokio::sync::{Notify, watch};
@@ -40,6 +41,8 @@ pub struct Desired {
     pub metadata: ModelMetadata,
     /// Hardware of the nodes serving the model, published in the deployment's `model_info`.
     pub hardware: Vec<HardwareInfo>,
+    /// The owner's price and slot limit, applied to the deployment.
+    pub settings: Option<ModelSettings>,
 }
 
 /// What to change in LiteLLM.
@@ -53,7 +56,7 @@ pub struct Plan {
 
 /// Diffs the wanted pairs against what LiteLLM holds.
 ///
-/// A deployment whose tags, owner, capability flags or hardware changed is replaced: LiteLLM
+/// A deployment whose tags, owner, capability flags, hardware or owner settings changed is replaced: LiteLLM
 /// has no partial update for `model_info`, and a stale classification is worse than one more
 /// round trip.
 #[must_use]
@@ -84,6 +87,7 @@ pub fn plan(wanted: &BTreeMap<(ClientId, ModelName), Advertised>, actual: &[Mana
                         && row.mode.as_deref() == publish.mode
                         && row.supports == publish.supports
                         && row.hardware == advertised.hardware
+                        && row.settings == advertised.settings
                         && kept.insert(name.clone())
                 }),
             None => false,
@@ -100,6 +104,7 @@ pub fn plan(wanted: &BTreeMap<(ClientId, ModelName), Advertised>, actual: &[Mana
             model: model.clone(),
             metadata: advertised.metadata.clone(),
             hardware: advertised.hardware.clone(),
+            settings: advertised.settings.clone(),
         })
         .collect();
     Plan { create, delete }
@@ -165,6 +170,7 @@ async fn mutate(litellm: &LiteLlm, plan: Plan) -> Result<(), LiteLlmError> {
                         &desired.model,
                         &desired.metadata,
                         &desired.hardware,
+                        desired.settings.as_ref(),
                     )
                     .await;
                 (desired.client, desired.model, result)
@@ -264,6 +270,7 @@ mod tests {
                             ..ModelMetadata::default()
                         },
                         hardware: Vec::new(),
+                        settings: None,
                     },
                 )
             })
@@ -298,6 +305,7 @@ mod tests {
             mode: publish.mode.map(str::to_owned),
             supports: publish.supports,
             hardware: Vec::new(),
+            settings: None,
         }
     }
 
@@ -325,6 +333,7 @@ mod tests {
                     ..ModelMetadata::default()
                 },
                 hardware: Vec::new(),
+                settings: None,
             }]
         );
         assert_eq!(plan.delete, vec!["1".to_owned()]);
@@ -365,6 +374,7 @@ mod tests {
             Advertised {
                 metadata: metadata.clone(),
                 hardware: Vec::new(),
+                settings: None,
             },
         )]);
         let mut actual = row("1", Some("u-tester/Org/model"), &["text"]);
@@ -399,6 +409,59 @@ mod tests {
         let plan = plan(&wanted, &[row("1", Some("u-tester/m"), &["text"])]);
         assert_eq!(plan.delete, vec!["1".to_owned()]);
         assert_eq!(plan.create[0].hardware, vec![gb10()]);
+    }
+
+    fn priced(max_slots: Option<u32>, output: &str) -> ModelSettings {
+        use reverse_core::inventory::{Price, Pricing};
+        ModelSettings {
+            max_slots,
+            pricing: Some(Pricing {
+                input_usd_per_mtok: Price::parse("0.3").unwrap(),
+                output_usd_per_mtok: Price::parse(output).unwrap(),
+                cache_read_usd_per_mtok: None,
+                cache_write_usd_per_mtok: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn keeps_a_deployment_whose_owner_settings_are_unchanged() {
+        let mut wanted = wanted(&[("u-tester", "m", &[ModelTag::Text])]);
+        for advertised in wanted.values_mut() {
+            advertised.settings = Some(priced(Some(4), "1.2"));
+        }
+        let mut actual = row("1", Some("u-tester/m"), &["text"]);
+        actual.settings = Some(priced(Some(4), "1.2"));
+        assert_eq!(plan(&wanted, &[actual]), Plan::default());
+    }
+
+    #[test]
+    fn replaces_a_deployment_when_the_owner_changes_the_price_or_the_slots() {
+        let mut wanted = wanted(&[("u-tester", "m", &[ModelTag::Text])]);
+        for advertised in wanted.values_mut() {
+            advertised.settings = Some(priced(Some(4), "1.2"));
+        }
+        for stale in [
+            Some(priced(Some(4), "1.0")),
+            Some(priced(Some(2), "1.2")),
+            None,
+        ] {
+            let mut actual = row("1", Some("u-tester/m"), &["text"]);
+            actual.settings = stale;
+            let plan = plan(&wanted, &[actual]);
+            assert_eq!(plan.delete, vec!["1".to_owned()]);
+            assert_eq!(plan.create[0].settings, Some(priced(Some(4), "1.2")));
+        }
+    }
+
+    #[test]
+    fn replaces_a_priced_deployment_whose_owner_removed_the_settings() {
+        let wanted = wanted(&[("u-tester", "m", &[ModelTag::Text])]);
+        let mut actual = row("1", Some("u-tester/m"), &["text"]);
+        actual.settings = Some(priced(None, "1.2"));
+        let plan = plan(&wanted, &[actual]);
+        assert_eq!(plan.delete, vec!["1".to_owned()]);
+        assert_eq!(plan.create[0].settings, None);
     }
 
     #[test]

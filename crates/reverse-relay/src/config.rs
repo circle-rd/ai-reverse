@@ -19,6 +19,19 @@ pub struct CatalogueCredentials {
     pub client_secret: SecretString,
 }
 
+/// Where the relay pushes its inventory and receives the owners' settings.
+#[derive(Debug, Clone)]
+pub struct InventoryConfig {
+    /// The receiver's endpoint.
+    pub url: String,
+    /// Shared secret that signs each push.
+    pub secret: SecretString,
+    /// Names this relay in the receiver's records.
+    pub relay_id: String,
+    /// Interval between pushes; a push is also the heartbeat of the live status.
+    pub interval: Duration,
+}
+
 /// Everything the relay needs, validated at startup.
 #[derive(Debug)]
 pub struct Config {
@@ -76,6 +89,9 @@ pub struct Config {
     pub trust_forwarded_for: bool,
     /// Credentials for the catalogue notification; `None` leaves auth-service to its own sync.
     pub catalogue: Option<CatalogueCredentials>,
+    /// The inventory push and settings channel; without it models are served unpriced and
+    /// unlimited and nothing is reported.
+    pub inventory: Option<InventoryConfig>,
 }
 
 impl Config {
@@ -150,6 +166,7 @@ impl Config {
             auth_lockout: env.duration_secs("RELAY_AUTH_LOCKOUT_SECS", 60)?,
             trust_forwarded_for: env.flag("RELAY_TRUST_FORWARDED_FOR")?,
             catalogue: catalogue_credentials(env)?,
+            inventory: inventory_config(env)?,
         })
     }
 }
@@ -178,6 +195,37 @@ fn catalogue_credentials<F: Fn(&str) -> Option<String>>(
             "RELAY_CATALOGUE_CLIENT_ID and RELAY_CATALOGUE_CLIENT_SECRET must be set together",
         )),
     }
+}
+
+fn inventory_config<F: Fn(&str) -> Option<String>>(
+    env: &Env<F>,
+) -> Result<Option<InventoryConfig>, ConfigError> {
+    let Some(url) = env.optional("RELAY_INVENTORY_URL")? else {
+        for key in ["RELAY_INVENTORY_SECRET", "RELAY_INVENTORY_RELAY_ID"] {
+            if env.optional(key)?.is_some() || env.optional(&format!("{key}_FILE"))?.is_some() {
+                return Err(ConfigError::invalid(key, "needs RELAY_INVENTORY_URL"));
+            }
+        }
+        return Ok(None);
+    };
+    let relay_id = env.required("RELAY_INVENTORY_RELAY_ID")?;
+    let valid_id = (1..=63).contains(&relay_id.len())
+        && relay_id.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && relay_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !valid_id {
+        return Err(ConfigError::invalid(
+            "RELAY_INVENTORY_RELAY_ID",
+            "expected 1 to 63 lowercase letters, digits or dashes",
+        ));
+    }
+    Ok(Some(InventoryConfig {
+        url: parse_https_url("RELAY_INVENTORY_URL", &url)?,
+        secret: env.required_secret("RELAY_INVENTORY_SECRET")?,
+        relay_id,
+        interval: env.duration_secs("RELAY_INVENTORY_INTERVAL_SECS", 15)?,
+    }))
 }
 
 fn socket_addr<F: Fn(&str) -> Option<String>>(
@@ -442,5 +490,51 @@ mod tests {
             load(&pairs).unwrap().litellm_url.as_str(),
             "https://gw.example.com/litellm/"
         );
+    }
+
+    const INVENTORY: [(&str, &str); 3] = [
+        (
+            "RELAY_INVENTORY_URL",
+            "https://raiversed.example.com/webhooks/relay/inventory",
+        ),
+        ("RELAY_INVENTORY_SECRET", "shared"),
+        ("RELAY_INVENTORY_RELAY_ID", "relay-eu-1"),
+    ];
+
+    #[test]
+    fn the_inventory_channel_is_off_by_default_and_complete_when_on() {
+        assert!(load(&BASE).unwrap().inventory.is_none());
+        let mut pairs = BASE.to_vec();
+        pairs.extend(INVENTORY);
+        let inventory = load(&pairs).unwrap().inventory.unwrap();
+        assert_eq!(
+            inventory.url,
+            "https://raiversed.example.com/webhooks/relay/inventory"
+        );
+        assert_eq!(inventory.relay_id, "relay-eu-1");
+        assert_eq!(inventory.interval, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn a_half_configured_inventory_channel_is_refused() {
+        for kept in [[0, 1], [0, 2], [1, 2]] {
+            let mut pairs = BASE.to_vec();
+            pairs.extend(kept.map(|i| INVENTORY[i]));
+            assert!(load(&pairs).is_err(), "{kept:?}");
+        }
+        let mut pairs = BASE.to_vec();
+        pairs.push(INVENTORY[1]);
+        assert!(load(&pairs).is_err());
+    }
+
+    #[test]
+    fn the_inventory_url_must_be_https_and_the_relay_id_a_slug() {
+        let mut pairs = BASE.to_vec();
+        pairs.extend(INVENTORY);
+        pairs[BASE.len()] = ("RELAY_INVENTORY_URL", "http://raiversed.example.com/x");
+        assert!(load(&pairs).is_err());
+        pairs[BASE.len()] = INVENTORY[0];
+        pairs[BASE.len() + 2] = ("RELAY_INVENTORY_RELAY_ID", "Relay EU");
+        assert!(load(&pairs).is_err());
     }
 }

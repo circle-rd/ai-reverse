@@ -8,18 +8,22 @@ use std::time::{Duration, Instant};
 use hyper::client::conn::http2::SendRequest;
 use reverse_core::body::ProxyBody;
 use reverse_core::ids::{ClientId, ModelName};
+use reverse_core::inventory::{InventoryModel, InventoryNode, ModelSettings};
+use reverse_core::status::AgentStatus;
 use reverse_core::wire::{HardwareInfo, ModelMetadata};
 use tokio::sync::Notify;
 
 /// A handle to send requests through one agent's tunnel.
 pub type TunnelSender = SendRequest<ProxyBody>;
 
-/// What the relay publishes for one `(client, model)` pair: the model's metadata and the
-/// hardware of the connected nodes that serve it.
+/// What the relay publishes for one `(client, model)` pair: the model's metadata, the
+/// hardware of the connected nodes that serve it and what its owner decided for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Advertised {
     pub metadata: ModelMetadata,
     pub hardware: Vec<HardwareInfo>,
+    /// The owner's price and slot limit; `None` until the owner decided anything.
+    pub settings: Option<ModelSettings>,
 }
 
 /// Last-seen time and advertised data of one `(client, model)` pair.
@@ -143,9 +147,12 @@ struct Tunnel {
     sender: TunnelSender,
     replaced: Arc<Notify>,
     node_id: String,
+    owner_sub: String,
+    agent_id: String,
     inflight: Arc<AtomicUsize>,
     models: BTreeMap<ModelName, ModelMetadata>,
     hardware: Option<HardwareInfo>,
+    status: Option<AgentStatus>,
     last_used: u64,
 }
 
@@ -155,6 +162,8 @@ struct Inner {
     next_use: u64,
     tunnels: HashMap<ClientId, Vec<Tunnel>>,
     book: ModelBook,
+    /// Owner decisions by published name (`{account}/{model}`), as the receiver last answered.
+    settings: BTreeMap<String, ModelSettings>,
 }
 
 /// Shared state of every tunnel, the API handlers and the reconciler.
@@ -162,6 +171,17 @@ struct Inner {
 pub struct Registry {
     inner: Mutex<Inner>,
     changed: Notify,
+}
+
+/// Who a tunnel belongs to, as the verified token and the agent say.
+#[derive(Debug, Clone)]
+pub struct NodeIdentity {
+    /// Internal id, unique per account and agent instance.
+    pub node_id: String,
+    /// Subject of the token: the owner.
+    pub owner_sub: String,
+    /// Agent instance id, the public id of the node.
+    pub agent_id: String,
 }
 
 /// Keeps a tunnel registered; dropping it unregisters the tunnel unless it was replaced.
@@ -223,9 +243,10 @@ impl Registry {
     pub fn attach(
         self: &Arc<Self>,
         client: ClientId,
-        node_id: String,
+        node: NodeIdentity,
         sender: TunnelSender,
     ) -> Lease {
+        let node_id = node.node_id;
         let replaced = Arc::new(Notify::new());
         let mut inner = self.lock();
         inner.next_generation += 1;
@@ -240,9 +261,12 @@ impl Registry {
             sender,
             replaced: replaced.clone(),
             node_id: node_id.clone(),
+            owner_sub: node.owner_sub,
+            agent_id: node.agent_id,
             inflight: Arc::new(AtomicUsize::new(0)),
             models: BTreeMap::new(),
             hardware: None,
+            status: None,
             last_used: 0,
         });
         drop(inner);
@@ -364,6 +388,62 @@ impl Registry {
         }
     }
 
+    /// Records the live status a connected node reported; `None` when it cannot report one.
+    pub fn record_status(&self, client: &ClientId, node_id: &str, status: Option<AgentStatus>) {
+        let mut inner = self.lock();
+        if let Some(tunnel) = inner
+            .tunnels
+            .get_mut(client)
+            .and_then(|all| all.iter_mut().find(|t| t.node_id == node_id))
+        {
+            tunnel.status = status;
+        }
+    }
+
+    /// Replaces the owners' decisions with the receiver's latest answer.
+    ///
+    /// Returns whether anything changed; a change wakes the reconciler, which replaces the
+    /// affected deployments.
+    pub fn set_settings(&self, settings: BTreeMap<String, ModelSettings>) -> bool {
+        let mut inner = self.lock();
+        if inner.settings == settings {
+            return false;
+        }
+        inner.settings = settings;
+        drop(inner);
+        self.changed.notify_one();
+        true
+    }
+
+    /// Every connected node as the inventory describes it, ordered by account then node.
+    #[must_use]
+    pub fn inventory_nodes(&self) -> Vec<InventoryNode> {
+        let inner = self.lock();
+        let mut nodes: Vec<InventoryNode> = inner
+            .tunnels
+            .iter()
+            .flat_map(|(client, all)| {
+                all.iter().map(move |t| InventoryNode {
+                    node_id: t.agent_id.clone(),
+                    owner_sub: t.owner_sub.clone(),
+                    owner_name: client.to_string(),
+                    hardware: t.hardware.clone(),
+                    status: t.status.clone(),
+                    models: t
+                        .models
+                        .iter()
+                        .map(|(model, metadata)| InventoryModel {
+                            name: format!("{client}/{model}"),
+                            tags: metadata.tags.clone(),
+                        })
+                        .collect(),
+                })
+            })
+            .collect();
+        nodes.sort_by(|a, b| (&a.owner_name, &a.node_id).cmp(&(&b.owner_name, &b.node_id)));
+        nodes
+    }
+
     /// Records the models a connected node serves right now.
     pub fn observe(&self, client: &ClientId, node_id: &str, models: &[(ModelName, ModelMetadata)]) {
         let mut inner = self.lock();
@@ -389,6 +469,7 @@ impl Registry {
                     Advertised {
                         metadata: metadata.clone(),
                         hardware,
+                        settings: None,
                     },
                 )
             })
@@ -400,10 +481,16 @@ impl Registry {
         }
     }
 
-    /// The pairs that must be registered in LiteLLM now, with their advertised data.
+    /// The pairs that must be registered in LiteLLM now, with their advertised data and the
+    /// owner's settings for each.
     #[must_use]
     pub fn wanted(&self, grace: Duration) -> BTreeMap<(ClientId, ModelName), Advertised> {
-        self.lock().book.wanted(grace, Instant::now())
+        let mut inner = self.lock();
+        let mut wanted = inner.book.wanted(grace, Instant::now());
+        for ((client, model), advertised) in &mut wanted {
+            advertised.settings = inner.settings.get(&format!("{client}/{model}")).cloned();
+        }
+        wanted
     }
 
     /// Resolves when a new model appeared.
@@ -431,6 +518,7 @@ mod tests {
                 ..ModelMetadata::default()
             },
             hardware: Vec::new(),
+            settings: None,
         }
     }
 
@@ -509,6 +597,7 @@ mod tests {
                     ..advertised(&[ModelTag::Text]).metadata
                 },
                 hardware: Vec::new(),
+                settings: None,
             },
         )];
         assert!(book.observe(&client, &enriched, t0 + Duration::from_secs(1)));

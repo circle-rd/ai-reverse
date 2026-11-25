@@ -18,6 +18,7 @@ hyper-util = { workspace = true }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
 reverse-core = { workspace = true }
+ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 subtle = { workspace = true }

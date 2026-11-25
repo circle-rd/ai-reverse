@@ -889,6 +889,7 @@ dependencies = [
  "reqwest",
  "reverse-agent",
  "reverse-core",
+ "ring",
  "serde",
  "serde_json",
  "subtle",

@@ -5,6 +5,7 @@
 pub mod engine;
 pub mod hub;
 pub mod idp;
+pub mod inventory;
 pub mod litellm;
 
 use std::collections::HashMap;
@@ -30,6 +31,7 @@ use tokio::task::JoinHandle;
 pub use engine::FakeEngine;
 pub use hub::FakeHub;
 pub use idp::FakeIdp;
+pub use inventory::{FakeInventory, INVENTORY_SECRET};
 pub use litellm::FakeLiteLlm;
 
 pub type TestBody = BoxBody<Bytes, Infallible>;
@@ -94,6 +96,8 @@ pub struct Options {
     pub model_tags: Option<&'static str>,
     pub max_tunnels_per_user: Option<&'static str>,
     pub max_tunnels: Option<&'static str>,
+    /// Starts a fake inventory receiver and points the relay at it.
+    pub inventory: bool,
 }
 
 impl Default for Options {
@@ -106,6 +110,7 @@ impl Default for Options {
             model_tags: Some("qwen3.8-27b=text"),
             max_tunnels_per_user: None,
             max_tunnels: None,
+            inventory: false,
         }
     }
 }
@@ -119,6 +124,7 @@ pub struct Stack {
     pub litellm: FakeLiteLlm,
     pub hub: FakeHub,
     pub idp: FakeIdp,
+    pub inventory: Option<FakeInventory>,
     pub relay_api: SocketAddr,
     pub relay_tunnel: SocketAddr,
     pub credential_file: std::path::PathBuf,
@@ -163,6 +169,11 @@ impl Stack {
         let litellm = FakeLiteLlm::start(LITELLM_KEY).await;
         let hub = FakeHub::start().await;
         let idp = FakeIdp::start("tester", AUDIENCE).await;
+        let inventory = if options.inventory {
+            Some(FakeInventory::start().await)
+        } else {
+            None
+        };
         prepare(&litellm);
 
         let dir = tempfile::tempdir().unwrap();
@@ -182,6 +193,14 @@ impl Stack {
             ("RELAY_CATALOGUE_CLIENT_ID", "reverse-relay".into()),
             ("RELAY_CATALOGUE_CLIENT_SECRET", "relay-secret".into()),
         ];
+        if let Some(inventory) = &inventory {
+            relay_pairs.extend([
+                ("RELAY_INVENTORY_URL", inventory.url()),
+                ("RELAY_INVENTORY_SECRET", INVENTORY_SECRET.to_owned()),
+                ("RELAY_INVENTORY_RELAY_ID", "relay-test".to_owned()),
+                ("RELAY_INVENTORY_INTERVAL_SECS", "1".to_owned()),
+            ]);
+        }
         if let Some(cap) = options.max_tunnels_per_user {
             relay_pairs.push(("RELAY_MAX_TUNNELS_PER_USER", cap.to_owned()));
         }
@@ -226,6 +245,7 @@ impl Stack {
             litellm,
             hub,
             idp,
+            inventory,
             relay_api,
             relay_tunnel,
             credential_file,

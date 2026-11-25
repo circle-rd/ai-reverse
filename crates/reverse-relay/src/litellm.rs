@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use reqwest::{Client, Method, RequestBuilder, Url, redirect};
 use reverse_core::ids::{ClientId, ModelName};
+use reverse_core::inventory::ModelSettings;
 use reverse_core::secret::SecretString;
 use reverse_core::wire::{AuthorSafetyClaim, HardwareInfo, ModelMetadata, ModelTag};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,8 @@ pub struct Managed {
     pub supports: Supports,
     /// Hardware of the nodes serving the model, as recorded in `model_info`; empty when absent.
     pub hardware: Vec<HardwareInfo>,
+    /// The owner's settings as recorded in `model_info`; `None` when absent or unreadable.
+    pub settings: Option<ModelSettings>,
 }
 
 /// Capability flags this relay publishes in `model_info`.
@@ -118,6 +121,10 @@ fn managed_rows(list: ModelInfoList) -> Vec<Managed> {
                     audio_output: info.supports_audio_output,
                 },
                 hardware: info.hardware.unwrap_or_default(),
+                // An unreadable value counts as absent, so the deployment is recreated.
+                settings: info
+                    .reverse_settings
+                    .and_then(|value| serde_json::from_value(value).ok()),
             })
         })
         .collect()
@@ -140,6 +147,8 @@ struct RowInfo {
     tags: Vec<String>,
     #[serde(default)]
     hardware: Option<Vec<HardwareInfo>>,
+    #[serde(default)]
+    reverse_settings: Option<serde_json::Value>,
     #[serde(default)]
     hub_owner: Option<String>,
     #[serde(default)]
@@ -170,6 +179,40 @@ struct LiteLlmParams<'a> {
     model: String,
     api_base: String,
     api_key: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_parallel_requests: Option<u32>,
+    #[serde(flatten)]
+    costs: Option<Costs>,
+}
+
+/// US dollars per token. LiteLLM routes on the copy in `litellm_params` and bills from the one
+/// in `model_info`, so both carry it.
+#[derive(Serialize, Clone, Copy)]
+struct Costs {
+    input_cost_per_token: f64,
+    output_cost_per_token: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_read_input_token_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_creation_input_token_cost: Option<f64>,
+}
+
+impl Costs {
+    fn of(settings: Option<&ModelSettings>) -> Option<Self> {
+        let pricing = settings?.pricing.as_ref()?;
+        Some(Self {
+            input_cost_per_token: pricing.input_usd_per_mtok.usd_per_token(),
+            output_cost_per_token: pricing.output_usd_per_mtok.usd_per_token(),
+            cache_read_input_token_cost: pricing
+                .cache_read_usd_per_mtok
+                .as_ref()
+                .map(|price| price.usd_per_token()),
+            cache_creation_input_token_cost: pricing
+                .cache_write_usd_per_mtok
+                .as_ref()
+                .map(|price| price.usd_per_token()),
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -187,6 +230,11 @@ struct NewModelInfo<'a> {
     author_safety_claim: Option<AuthorSafetyClaim>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hardware: Option<&'a [HardwareInfo]>,
+    /// The owner's decision as received, kept to tell whether the deployment is current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reverse_settings: Option<&'a ModelSettings>,
+    #[serde(flatten)]
+    costs: Option<Costs>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -269,6 +317,7 @@ impl LiteLlm {
         model: &ModelName,
         metadata: &ModelMetadata,
         hardware: &[HardwareInfo],
+        settings: Option<&ModelSettings>,
     ) -> Result<(), LiteLlmError> {
         let name = format!("{client}/{model}");
         let publish = Publish::from_tags(&metadata.tags);
@@ -278,6 +327,8 @@ impl LiteLlm {
                 model: format!("{}/{model}", self.provider),
                 api_base: format!("{}/{client}/v1", self.public_api_base),
                 api_key: self.api_key.expose(),
+                max_parallel_requests: settings.and_then(|s| s.max_slots),
+                costs: Costs::of(settings),
             },
             model_info: NewModelInfo {
                 managed_by: MANAGED_BY,
@@ -289,6 +340,8 @@ impl LiteLlm {
                 hub_avatar_url: metadata.hub_avatar_url.as_deref(),
                 author_safety_claim: metadata.author_safety_claim,
                 hardware: (!hardware.is_empty()).then_some(hardware),
+                reverse_settings: settings,
+                costs: Costs::of(settings),
                 mode: publish.mode,
                 supports_function_calling: publish.supports.function_calling.then_some(true),
                 supports_vision: publish.supports.vision.then_some(true),
