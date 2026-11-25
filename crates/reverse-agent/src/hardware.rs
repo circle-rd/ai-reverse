@@ -57,11 +57,13 @@ fn gpu_models(dir: &Path) -> Vec<String> {
     models
 }
 
-/// Extracts the `Model:` line of `/proc/driver/nvidia/gpus/*/information`.
+/// Extracts the `Model:` line of `/proc/driver/nvidia/gpus/*/information`. The driver reports
+/// `Unknown` for a GPU it cannot name (unified-memory GB10), which says nothing and is dropped.
 fn gpu_model(text: &str) -> Option<String> {
     text.lines()
         .find_map(|line| line.strip_prefix("Model:"))
         .and_then(|model| clean(model.to_owned()))
+        .filter(|model| !model.eq_ignore_ascii_case("unknown"))
 }
 
 fn mem_total_kib(meminfo: &str) -> Option<u64> {
@@ -86,10 +88,13 @@ fn count_processors(cpuinfo: &str) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
-/// GB10 is the chip of every DGX Spark and of its OEM siblings.
+/// GB10 is the chip of every DGX Spark and of its OEM siblings; the driver may not name it, so
+/// the product name (for example `Dell Pro Max with GB10`) is checked as well as the GPU.
 fn classify(product: Option<&str>, gpus: &[String]) -> HardwareKind {
-    let spark = product.is_some_and(|p| p.to_ascii_lowercase().contains("dgx spark"))
-        || gpus.iter().any(|g| g.to_ascii_uppercase().contains("GB10"));
+    let names_gb10 = |text: &str| text.to_ascii_uppercase().contains("GB10");
+    let spark = product
+        .is_some_and(|p| p.to_ascii_lowercase().contains("dgx spark") || names_gb10(p))
+        || gpus.iter().any(|g| names_gb10(g));
     if spark {
         HardwareKind::DgxSpark
     } else {
@@ -144,6 +149,26 @@ mod tests {
             classify(Some("ASUS Ascent GX10"), &gpus),
             HardwareKind::DgxSpark
         );
+    }
+
+    #[test]
+    fn an_oem_gb10_the_driver_cannot_name_is_recognised_by_its_product() {
+        assert_eq!(
+            classify(Some("Dell Pro Max with GB10 FCM1253"), &[]),
+            HardwareKind::DgxSpark
+        );
+        assert_eq!(classify(Some("PowerEdge R760"), &[]), HardwareKind::Other);
+    }
+
+    #[test]
+    fn a_gpu_the_driver_reports_as_unknown_is_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "proc/driver/nvidia/gpus/000f:01:00.0/information",
+            "Model: \t\t Unknown\nIRQ:   \t\t 12\n",
+        );
+        assert!(detect(dir.path()).gpus.is_empty());
     }
 
     #[test]
