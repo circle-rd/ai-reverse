@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 
 use crate::engine::{self, Memo, Reading};
+use crate::gpu;
 use crate::host::{self, CpuTimes};
 use crate::upstream::Upstream;
 
@@ -58,7 +59,7 @@ pub async fn run(
         };
         let host = host::read_host(Path::new("/"), &mut cpu);
         let unified = inputs.hardware == HardwareKind::DgxSpark;
-        let gpus = host::read_gpus(unified, host.memory_used_percent).await;
+        let gpus = gpu::read(unified, host.memory_used_percent).await;
         let inflight = inputs.inflight.load(Ordering::Relaxed);
 
         // Without engine metrics the requests crossing this agent are the best load signal.

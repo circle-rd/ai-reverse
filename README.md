@@ -74,7 +74,8 @@ flowchart LR
 - Request bodies are bounded (64 MiB default) with idle stall guards in both
   directions.
 - The runtime image is `scratch`, non-root (UID/GID 65532), read-only, with no
-  shell, no package manager, `cap_drop: ALL` and `no-new-privileges`.
+  shell, no package manager, `cap_drop: ALL` and `no-new-privileges`. The optional
+  `-gpu` image trades `scratch` for Debian 13 slim to carry nvtop (AGENTS.md, E3).
 
 ## Requirements
 
@@ -303,11 +304,17 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
     through `/props`; SGLang and vLLM do not expose their capacity, so set
     `AGENT_MAX_SLOTS` or the status carries `hint: "capacity-not-exposed"`.
     Without engine metrics the load falls back to the requests crossing the agent.
-  - **GPU figures** come from `nvidia-smi`, run by the agent when it is on the
-    `PATH`. The published agent image is `FROM scratch` and has no `nvidia-smi`:
-    run the agent natively, or in an image that has it, to get GPU load,
-    temperature and power. Without it `gpus` is empty. On a unified-memory GB10
-    machine the GPU memory share is the system memory share (`memoryShared`).
+  - **GPU figures** come from `nvtop -s` (NVIDIA on x86 and ARM, AMD, Intel), run by
+    the agent with an empty environment. It uses the first `nvtop` on its `PATH`: an
+    agent installed natively uses the host's, and the `-gpu` image uses the 3.4.0 it
+    ships (below). A container cannot borrow the host's binary, which is linked
+    against the host's libraries. Without `nvtop`, or without GPU access, `gpus` is
+    empty. Values are device-wide, so a container reports what the host would, with
+    two rules: memory in use is computed from `mem_used` and `mem_total`, never from
+    `mem_util` (the memory controller activity on NVIDIA before nvtop 3.3), so an old
+    nvtop gives `-1` rather than a wrong number; and on a unified-memory GB10 the
+    memory share is the system memory share (`memoryShared`), because the snapshot's
+    own figure only counts the GPU processes the caller can see.
 - Changing tags, owner, avatar, author claim, capability flags or hardware replaces the
   deployment on the next reconcile: LiteLLM has no partial `model_info` update,
   so the old row is deleted and recreated with the new metadata.
@@ -341,16 +348,27 @@ the box.
 
 ## Container images
 
-The workflows publish `ghcr.io/circle-rd/ai-reverse-agent` (`Dockerfile`) and
+The workflows publish `ghcr.io/circle-rd/ai-reverse-agent` (`Dockerfile`),
+`ghcr.io/circle-rd/ai-reverse-agent-gpu` (`Dockerfile`, target `gpu`) and
 `ghcr.io/circle-rd/ai-reverse-relay` (`Dockerfile.relay`) for `linux/amd64` and
 `linux/arm64`:
 
 | Tag | Source |
 | --- | --- |
-| `nightly` | Manual dispatch (`nightly.yml`), builds both images from `develop` by default; superseded nightly versions are deleted. |
-| `latest`, `X.Y`, `X.Y.Z` | Git tags `v*` (`release.yml`), both images. |
+| `nightly` | Manual dispatch (`nightly.yml`), builds the images from `develop` by default; superseded nightly versions are deleted. |
+| `latest`, `X.Y`, `X.Y.Z` | Git tags `v*` (`release.yml`), every image. |
 
 Pin the image by digest in production.
+
+### GPU image
+
+`ai-reverse-agent-gpu` is the same agent on Debian 13 slim next to nvtop 3.4.0 (built
+from a pinned, checksummed release; GPL-3, licence and source pointer in
+`/usr/share/doc/nvtop`), so the status carries GPU load, memory, temperature and power
+(AGENTS.md, exception E3). It keeps the non-root user, read-only root and
+`cap_drop: ALL`. Give it the GPU with `gpus: all` (the image already sets
+`NVIDIA_DRIVER_CAPABILITIES=utility`); for an AMD or Intel GPU pass `/dev/dri` and the
+`render` group instead. See `deploy/agent/compose.example.yml`.
 
 ## Run with Cargo
 

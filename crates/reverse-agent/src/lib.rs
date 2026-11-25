@@ -8,6 +8,7 @@ pub mod credential;
 pub mod discovery;
 pub mod engine;
 pub mod error;
+pub mod gpu;
 pub mod hardware;
 pub mod host;
 pub mod proxy;

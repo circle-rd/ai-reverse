@@ -65,7 +65,7 @@ baseline; when a material conflict remains, stop and ask before mutation.
 | `cargo test --workspace --all-targets --all-features --locked` | Unit and integration suite (CI gate) |
 | `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked` | Documentation gate |
 | `cargo audit` | Dependency advisories (CI gate) |
-| `docker build -t reverse-agent -f Dockerfile .` and `docker build -t reverse-relay -f Dockerfile.relay .` | Container builds (CI gate) |
+| `docker build -t reverse-agent -f Dockerfile .`, `docker build --target gpu -t reverse-agent-gpu -f Dockerfile .` and `docker build -t reverse-relay -f Dockerfile.relay .` | Container builds (CI gate) |
 
 A change is mergeable only when formatting, Clippy, all tests, documentation,
 `cargo audit`, and the Docker build pass — the exact steps
@@ -401,7 +401,7 @@ private helpers.
   about the box leaves it. Turning the lookup off keeps ids on the box.
 - Runtime image: `scratch`, non-root (UID/GID 65532), read-only root filesystem,
   no shell, no package manager, `cap_drop: ALL`, `no-new-privileges`, core dumps
-  disabled by the runtime.
+  disabled by the runtime. The GPU variant is the documented exception E3.
 - Secrets come from the environment or `*_FILE` variables; supplying both forms
   is rejected. The credential file lives in the writable `/var/lib/reverse-agent`
   volume.
@@ -431,7 +431,7 @@ private helpers.
   (including the `u-` account namespace) live in `crates/reverse-core/src/ids.rs`.
   Update them, their tests and the README in the same change.
 - User-visible behavior changes need tests and documentation in the same change.
-- Release tags are `v*`; both images (agent and relay) publish `nightly` from
+- Release tags are `v*`; the agent, GPU agent and relay images publish `nightly` from
   manual dispatch and semver plus `latest` from tags, for `linux/amd64` and
   `linux/arm64`.
 - Keep `AGENTS.md` truthful. If a rule is intentionally violated, document the
@@ -483,3 +483,26 @@ Undocumented exceptions are defects.
    an agent.
 6. **Revisit:** if the identity provider gains an out-of-band channel for
    device codes.
+
+### E3 — The GPU agent image is not `scratch`
+
+1. **Rule relaxed:** the runtime image is `scratch`, with no shell and no package
+   manager (section 8).
+2. **Why:** GPU load, memory, temperature and power can only be read through the
+   vendor libraries that `nvtop` loads, and `nvtop` is a dynamic glibc program that
+   cannot run on `scratch`.
+3. **Risk/impact:** a larger image (Debian 13 slim, about 90 MB) with a shell, a
+   package database and the system libraries `nvtop` needs, and a GPL-3 binary
+   shipped next to the MIT agent.
+4. **Mitigation:** the variant is a separate image (`ai-reverse-agent-gpu`, the `gpu`
+   target of `Dockerfile`); the default image stays `scratch`. It keeps the non-root
+   user, read-only root, `cap_drop: ALL` and `no-new-privileges` (validated on
+   arm64 and amd64). `nvtop` is built from a pinned, checksummed release tarball,
+   runs as a separate process with an empty environment (the agent's credentials
+   are never passed to it), and its licence and source pointer ship in
+   `/usr/share/doc/nvtop`.
+5. **Rejected alternative:** reading the GPU from the driver in-process (an FFI
+   dependency, and `unsafe_code` is forbidden), and adding `nvtop` to the default
+   image (impossible on `scratch`).
+6. **Revisit:** if the default image moves to a glibc base, or if the engines
+   expose GPU figures themselves.

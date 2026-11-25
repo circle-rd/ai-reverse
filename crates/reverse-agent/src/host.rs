@@ -1,23 +1,11 @@
-//! Load of the host, read from `/proc` and `/sys`, and of its GPUs, read from `nvidia-smi`.
-//!
-//! Nothing here needs a privilege. `nvidia-smi` is optional: on a host or in an image that
-//! lacks it the GPU figures are simply absent, never guessed.
+//! Load of the host, read from `/proc` and `/sys`. Nothing here needs a privilege.
 
 use std::fs;
-use std::io;
 use std::path::Path;
-use std::process::Stdio;
-use std::time::Duration;
 
-use reverse_core::status::{GpuStatus, HostStatus, UNKNOWN, UNKNOWN_F64};
-use tokio::process::Command;
+use reverse_core::status::{HostStatus, UNKNOWN};
 
 use crate::hardware::meminfo_kib;
-
-const NVIDIA_SMI: &str = "nvidia-smi";
-const NVIDIA_SMI_QUERY: &str =
-    "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw";
-const NVIDIA_SMI_BUDGET: Duration = Duration::from_secs(4);
 
 /// Cumulative CPU time of the previous sample, the base of the next load figure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,78 +101,6 @@ fn hottest_zone_c(dir: &Path) -> i32 {
         .map_or(UNKNOWN, |milli| milli / 1000)
 }
 
-/// Asks `nvidia-smi` about every GPU.
-///
-/// Returns an empty list when the tool is absent or fails: the figures are optional, and the
-/// caller keeps asking so a driver that comes up late is picked up.
-pub async fn read_gpus(unified_memory: bool, host_memory_percent: i32) -> Vec<GpuStatus> {
-    match query_nvidia_smi().await {
-        Ok(csv) => parse_nvidia_smi(&csv, unified_memory, host_memory_percent),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            tracing::debug!("gpu.nvidia_smi_absent");
-            Vec::new()
-        }
-        Err(error) => {
-            tracing::debug!(%error, "gpu.nvidia_smi_failed");
-            Vec::new()
-        }
-    }
-}
-
-async fn query_nvidia_smi() -> io::Result<String> {
-    let mut command = Command::new(NVIDIA_SMI);
-    command
-        .args([NVIDIA_SMI_QUERY, "--format=csv,noheader,nounits"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(NVIDIA_SMI_BUDGET, command.output())
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "nvidia-smi timed out"))??;
-    if !output.status.success() {
-        return Err(io::Error::other("nvidia-smi exited with an error"));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// Parses `name, util %, mem used MiB, mem total MiB, temp C, power W`; `[N/A]` is unknown.
-///
-/// A unified-memory GPU reports no memory of its own: its memory is the system's, so the host
-/// share stands in and the entry says so.
-fn parse_nvidia_smi(csv: &str, unified_memory: bool, host_memory_percent: i32) -> Vec<GpuStatus> {
-    csv.lines()
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-            let [name, util, used, total, temp, power] = fields[..] else {
-                return None;
-            };
-            let number = |raw: &str| raw.parse::<f64>().ok().filter(|v| v.is_finite());
-            let memory = match (number(used), number(total)) {
-                (Some(used), Some(total)) if total > 0.0 => Some(percent(used / total * 100.0)),
-                _ => None,
-            };
-            Some(GpuStatus {
-                name: name.to_owned(),
-                utilization_percent: number(util).map_or(UNKNOWN, percent),
-                memory_used_percent: match (memory, unified_memory) {
-                    (Some(memory), _) => memory,
-                    (None, true) => host_memory_percent,
-                    (None, false) => UNKNOWN,
-                },
-                memory_shared: memory.is_none() && unified_memory,
-                temperature_c: number(temp).map_or(UNKNOWN, percent),
-                power_watts: number(power).map_or(UNKNOWN_F64, |watts| watts.max(0.0)),
-            })
-        })
-        .collect()
-}
-
-/// Rounds a reading to a whole number; used for percentages and degrees alike.
-#[allow(clippy::cast_possible_truncation)]
-fn percent(value: f64) -> i32 {
-    value.round().clamp(0.0, f64::from(i32::MAX)) as i32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,42 +155,5 @@ mod tests {
         assert_eq!(host.cpu_load_percent, UNKNOWN);
         assert_eq!(host.memory_used_percent, UNKNOWN);
         assert_eq!(host.cpu_temperature_c, UNKNOWN);
-    }
-
-    // Verbatim from a Dell Pro Max with GB10 and from a dual RTX 4090 host.
-    #[test]
-    fn a_unified_memory_gpu_borrows_the_host_memory_share() {
-        let gpus = parse_nvidia_smi("NVIDIA GB10, 0, [N/A], [N/A], 36, 6.86\n", true, 41);
-        assert_eq!(gpus.len(), 1);
-        assert_eq!(gpus[0].memory_used_percent, 41);
-        assert!(gpus[0].memory_shared);
-        assert_eq!(gpus[0].temperature_c, 36);
-        assert!((gpus[0].power_watts - 6.86).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn discrete_gpus_report_their_own_memory() {
-        let gpus = parse_nvidia_smi(
-            "NVIDIA GeForce RTX 4090, 12, 1088, 24564, 25, 26.75\nNVIDIA GeForce RTX 4090, 0, 12, 24564, 26, 6.53\n",
-            false,
-            50,
-        );
-        assert_eq!(gpus.len(), 2);
-        assert_eq!(gpus[0].utilization_percent, 12);
-        assert_eq!(gpus[0].memory_used_percent, 4);
-        assert!(!gpus[0].memory_shared);
-    }
-
-    #[test]
-    fn a_discrete_gpu_with_no_memory_reading_stays_unknown() {
-        let gpus = parse_nvidia_smi("RTX, [N/A], [N/A], [N/A], [N/A], [N/A]\n", false, 50);
-        assert_eq!(gpus[0].memory_used_percent, UNKNOWN);
-        assert_eq!(gpus[0].utilization_percent, UNKNOWN);
-        assert!(gpus[0].power_watts < 0.0);
-    }
-
-    #[test]
-    fn a_malformed_line_is_skipped() {
-        assert!(parse_nvidia_smi("garbage\n", false, 0).is_empty());
     }
 }

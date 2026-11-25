@@ -63,6 +63,9 @@ jobs:
         include:
           - name: agent
             dockerfile: Dockerfile
+          - name: agent-gpu
+            dockerfile: Dockerfile
+            target: gpu
           - name: relay
             dockerfile: Dockerfile.relay
     steps:
@@ -72,6 +75,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
           push: false
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
