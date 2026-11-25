@@ -117,9 +117,9 @@ pub async fn handle(
         }
     };
     state.limiter.success(address);
-    if state.registry.tunnel_count(&identity.username) >= state.max_tunnels_per_user {
+    if state.registry.tunnel_count(&identity.account) >= state.max_tunnels_per_user {
         tracing::warn!(
-            user = %identity.username,
+            user = %identity.account,
             %peer,
             "tunnel.rejected_account_capacity"
         );
@@ -139,16 +139,16 @@ pub async fn handle(
     tokio::spawn(async move {
         let _permit = permit;
         tracing::info!(
-            user = %identity.username,
+            user = %identity.account,
             node_id = %identity.node_id(),
             %peer,
             "tunnel.accepted"
         );
         match on_upgrade.await {
             Ok(upgraded) => match run_tunnel(upgraded, &identity, &state).await {
-                Ok(()) => tracing::info!(user = %identity.username, %peer, "tunnel.closed"),
+                Ok(()) => tracing::info!(user = %identity.account, %peer, "tunnel.closed"),
                 Err(error) => {
-                    tracing::warn!(user = %identity.username, %peer, %error, "tunnel.failed");
+                    tracing::warn!(user = %identity.account, %peer, %error, "tunnel.failed");
                 }
             },
             Err(error) => tracing::warn!(%peer, %error, "tunnel.upgrade_failed"),
@@ -202,11 +202,11 @@ async fn run_tunnel(
     let node_id = identity.node_id();
     let lease = state
         .registry
-        .attach(identity.username.clone(), node_id.clone(), sender.clone());
-    tracing::info!(user = %identity.username, node_id = %node_id, "tunnel.registered");
+        .attach(identity.account.clone(), node_id.clone(), sender.clone());
+    tracing::info!(user = %identity.account, node_id = %node_id, "tunnel.registered");
     let watcher = watcher::run(
         sender,
-        identity.username.clone(),
+        identity.account.clone(),
         node_id,
         state.registry.clone(),
         state.models_poll,

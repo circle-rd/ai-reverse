@@ -10,23 +10,23 @@ use http_body_util::BodyExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const CHAT: &str = "/tester/v1/chat/completions";
+const CHAT: &str = "/u-tester/v1/chat/completions";
 
 #[tokio::test]
 async fn registers_the_served_model_and_streams_a_completion() {
     let stack = Stack::start(Options::default()).await;
 
     let row = eventually("the deployment to be registered", || async {
-        stack.litellm.row("tester/qwen3.8-27b")
+        stack.litellm.row("u-tester/qwen3.8-27b")
     })
     .await;
     assert_eq!(row["litellm_params"]["model"], "hosted_vllm/qwen3.8-27b");
     assert_eq!(
         row["litellm_params"]["api_base"],
-        "http://relay.test/tester/v1"
+        "http://relay.test/u-tester/v1"
     );
     assert_eq!(row["model_info"]["managed_by"], "reverse-relay");
-    assert_eq!(row["model_info"]["created_by"], "tester");
+    assert_eq!(row["model_info"]["created_by"], "u-tester");
     assert_eq!(
         row["model_info"]["hardware"][0]["cpuArch"],
         std::env::consts::ARCH
@@ -68,7 +68,9 @@ async fn an_embedding_model_outside_the_engine_list_is_announced_and_tagged() {
     .await;
 
     let row = eventually("the embedding deployment to be registered", || async {
-        stack.litellm.row("tester/perplexity-ai/pplx-embed-v1-0.6b")
+        stack
+            .litellm
+            .row("u-tester/perplexity-ai/pplx-embed-v1-0.6b")
     })
     .await;
     assert_eq!(row["model_info"]["mode"], "embedding");
@@ -81,13 +83,13 @@ async fn an_embedding_model_outside_the_engine_list_is_announced_and_tagged() {
     assert_eq!(row["model_info"]["author_safety_claim"], "abliterated");
 
     let llm = eventually("the tagged LLM deployment to be registered", || async {
-        stack.litellm.row("tester/qwen3.8-27b")
+        stack.litellm.row("u-tester/qwen3.8-27b")
     })
     .await;
     assert_eq!(llm["model_info"]["tags"][0], "text");
     assert_eq!(llm["model_info"]["tags"][1], "tools");
     assert_eq!(llm["model_info"]["supports_function_calling"], true);
-    assert_eq!(llm["model_info"]["created_by"], "tester");
+    assert_eq!(llm["model_info"]["created_by"], "u-tester");
     stack.shutdown().await;
 }
 
@@ -95,19 +97,19 @@ async fn an_embedding_model_outside_the_engine_list_is_announced_and_tagged() {
 async fn a_model_change_on_the_engine_replaces_the_deployment() {
     let stack = Stack::start(Options::default()).await;
     eventually("the first model", || async {
-        stack.litellm.row("tester/qwen3.8-27b")
+        stack.litellm.row("u-tester/qwen3.8-27b")
     })
     .await;
 
     stack.engine.set_models(&["alpha"]);
     eventually("alpha to replace the first model", || async {
-        (stack.litellm.names() == ["tester/alpha"]).then_some(())
+        (stack.litellm.names() == ["u-tester/alpha"]).then_some(())
     })
     .await;
 
     stack.engine.set_models(&["Org/beta-7b"]);
     eventually("beta to replace alpha", || async {
-        (stack.litellm.names() == ["tester/Org/beta-7b"]).then_some(())
+        (stack.litellm.names() == ["u-tester/Org/beta-7b"]).then_some(())
     })
     .await;
     stack.shutdown().await;
@@ -117,7 +119,7 @@ async fn a_model_change_on_the_engine_replaces_the_deployment() {
 async fn an_engine_outage_deregisters_after_the_grace_period_and_recovers() {
     let stack = Stack::start(Options::default()).await;
     eventually("the model", || async {
-        stack.litellm.row("tester/qwen3.8-27b")
+        stack.litellm.row("u-tester/qwen3.8-27b")
     })
     .await;
 
@@ -129,7 +131,7 @@ async fn an_engine_outage_deregisters_after_the_grace_period_and_recovers() {
 
     stack.engine.set_models(&["qwen3.8-27b"]);
     eventually("the model to return", || async {
-        stack.litellm.row("tester/qwen3.8-27b")
+        stack.litellm.row("u-tester/qwen3.8-27b")
     })
     .await;
     stack.shutdown().await;
@@ -139,7 +141,7 @@ async fn an_engine_outage_deregisters_after_the_grace_period_and_recovers() {
 async fn a_dropped_agent_is_deregistered_and_requests_get_a_503() {
     let mut stack = Stack::start(Options::default()).await;
     eventually("the model", || async {
-        stack.litellm.row("tester/qwen3.8-27b")
+        stack.litellm.row("u-tester/qwen3.8-27b")
     })
     .await;
 
@@ -160,7 +162,7 @@ async fn a_dropped_agent_is_deregistered_and_requests_get_a_503() {
 async fn a_client_disconnect_cancels_the_stream_on_the_engine() {
     let stack = Stack::start(Options::default()).await;
     eventually("the model", || async {
-        stack.litellm.row("tester/qwen3.8-27b")
+        stack.litellm.row("u-tester/qwen3.8-27b")
     })
     .await;
 
@@ -186,24 +188,27 @@ async fn a_client_disconnect_cancels_the_stream_on_the_engine() {
 async fn only_allowlisted_routes_and_connected_clients_are_served() {
     let stack = Stack::start(Options::default()).await;
     eventually("the model", || async {
-        stack.litellm.row("tester/qwen3.8-27b")
+        stack.litellm.row("u-tester/qwen3.8-27b")
     })
     .await;
 
     let health = send(stack.relay_api, Method::GET, "/healthz", "").await;
     assert_eq!(health.status, StatusCode::OK);
 
-    let files = send(stack.relay_api, Method::POST, "/tester/v1/files", "{}").await;
+    let files = send(stack.relay_api, Method::POST, "/u-tester/v1/files", "{}").await;
     assert_eq!(files.status, StatusCode::NOT_FOUND);
     assert_eq!(files.json()["error"]["code"], "route_not_allowed");
 
-    let admin = send(stack.relay_api, Method::POST, "/tester/flush_cache", "{}").await;
+    let admin = send(stack.relay_api, Method::POST, "/u-tester/flush_cache", "{}").await;
     assert_eq!(admin.status, StatusCode::NOT_FOUND);
 
     let nobody = send(stack.relay_api, Method::GET, "/nobody1/v1/models", "").await;
     assert_eq!(nobody.status, StatusCode::SERVICE_UNAVAILABLE);
 
-    let models = send(stack.relay_api, Method::GET, "/tester/v1/models", "").await;
+    let plain = send(stack.relay_api, Method::GET, "/tester/v1/models", "").await;
+    assert_eq!(plain.status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let models = send(stack.relay_api, Method::GET, "/u-tester/v1/models", "").await;
     assert_eq!(models.status, StatusCode::OK);
     assert_eq!(models.json()["data"][0]["id"], "qwen3.8-27b");
     stack.shutdown().await;
@@ -308,7 +313,7 @@ async fn the_api_port_requires_the_shared_key() {
     ] {
         let reply = raw_exchange(
             stack.relay_api,
-            &format!("GET /tester/v1/models HTTP/1.1\r\nhost: relay\r\n{auth}\r\n"),
+            &format!("GET /u-tester/v1/models HTTP/1.1\r\nhost: relay\r\n{auth}\r\n"),
         )
         .await;
         assert!(reply.starts_with("HTTP/1.1 401"), "{auth:?}: {reply}");
@@ -334,7 +339,7 @@ async fn orphaned_deployments_are_cleaned_up_but_foreign_ones_are_kept() {
         let names = stack.litellm.names();
         (!names.contains(&"ghost/old-model".to_owned())
             && names.contains(&"operator/own-model".to_owned())
-            && names.contains(&"tester/qwen3.8-27b".to_owned()))
+            && names.contains(&"u-tester/qwen3.8-27b".to_owned()))
         .then_some(())
     })
     .await;
@@ -348,7 +353,7 @@ async fn shutting_down_removes_what_the_relay_registered() {
     })
     .await;
     eventually("the model", || async {
-        stack.litellm.row("tester/qwen3.8-27b")
+        stack.litellm.row("u-tester/qwen3.8-27b")
     })
     .await;
 
@@ -410,7 +415,7 @@ async fn an_account_cannot_exceed_its_tunnel_cap() {
     })
     .await;
     eventually("the first tunnel to register", || async {
-        (stack.litellm.names() == ["tester/qwen3.8-27b"]).then_some(())
+        (stack.litellm.names() == ["u-tester/qwen3.8-27b"]).then_some(())
     })
     .await;
     let token = stack
@@ -429,7 +434,7 @@ async fn a_registered_model_notifies_auth_service_once_it_is_visible() {
     let stack = Stack::start(Options::default()).await;
 
     eventually("the deployment to be registered", || async {
-        stack.litellm.row("tester/qwen3.8-27b")
+        stack.litellm.row("u-tester/qwen3.8-27b")
     })
     .await;
     eventually("auth-service to be notified", || async {
@@ -444,7 +449,7 @@ async fn an_unchanged_model_list_does_not_notify_again() {
     let stack = Stack::start(Options::default()).await;
 
     eventually("the deployment to be registered", || async {
-        stack.litellm.row("tester/qwen3.8-27b")
+        stack.litellm.row("u-tester/qwen3.8-27b")
     })
     .await;
     eventually("auth-service to be notified", || async {

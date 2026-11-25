@@ -312,13 +312,13 @@ mod tests {
 
     #[test]
     fn creates_missing_and_deletes_unwanted() {
-        let wanted = wanted(&[("tester", "new", &[ModelTag::Text])]);
-        let actual = [row("1", Some("tester/old"), &["text"])];
+        let wanted = wanted(&[("u-tester", "new", &[ModelTag::Text])]);
+        let actual = [row("1", Some("u-tester/old"), &["text"])];
         let plan = plan(&wanted, &actual);
         assert_eq!(
             plan.create,
             vec![Desired {
-                client: ClientId::parse("tester").unwrap(),
+                client: ClientId::parse("u-tester").unwrap(),
                 model: ModelName::parse("new").unwrap(),
                 metadata: ModelMetadata {
                     tags: vec![ModelTag::Text],
@@ -332,15 +332,15 @@ mod tests {
 
     #[test]
     fn keeps_what_is_already_registered_with_the_same_tags() {
-        let wanted = wanted(&[("tester", "m", &[ModelTag::Text])]);
-        let plan = plan(&wanted, &[row("1", Some("tester/m"), &["text"])]);
+        let wanted = wanted(&[("u-tester", "m", &[ModelTag::Text])]);
+        let plan = plan(&wanted, &[row("1", Some("u-tester/m"), &["text"])]);
         assert_eq!(plan, Plan::default());
     }
 
     #[test]
     fn replaces_a_deployment_whose_tags_changed() {
-        let wanted = wanted(&[("tester", "m", &[ModelTag::Text, ModelTag::Tools])]);
-        let actual = [row("1", Some("tester/m"), &["text"])];
+        let wanted = wanted(&[("u-tester", "m", &[ModelTag::Text, ModelTag::Tools])]);
+        let actual = [row("1", Some("u-tester/m"), &["text"])];
         let plan = plan(&wanted, &actual);
         assert_eq!(plan.delete, vec!["1".to_owned()]);
         assert_eq!(plan.create.len(), 1);
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn replaces_a_deployment_when_hub_display_metadata_changes() {
-        let client = ClientId::parse("tester").unwrap();
+        let client = ClientId::parse("u-tester").unwrap();
         let model = ModelName::parse("Org/model").unwrap();
         let metadata = ModelMetadata {
             tags: vec![ModelTag::Text],
@@ -367,7 +367,7 @@ mod tests {
                 hardware: Vec::new(),
             },
         )]);
-        let mut actual = row("1", Some("tester/Org/model"), &["text"]);
+        let mut actual = row("1", Some("u-tester/Org/model"), &["text"]);
         actual.hub_owner = metadata.hub_owner.clone();
         actual.hub_avatar_url = metadata.hub_avatar_url.clone();
         actual.author_safety_claim = metadata.author_safety_claim;
@@ -381,11 +381,11 @@ mod tests {
 
     #[test]
     fn keeps_a_deployment_whose_hardware_is_unchanged() {
-        let mut wanted = wanted(&[("tester", "m", &[ModelTag::Text])]);
+        let mut wanted = wanted(&[("u-tester", "m", &[ModelTag::Text])]);
         for advertised in wanted.values_mut() {
             advertised.hardware = vec![gb10()];
         }
-        let mut actual = row("1", Some("tester/m"), &["text"]);
+        let mut actual = row("1", Some("u-tester/m"), &["text"]);
         actual.hardware = vec![gb10()];
         assert_eq!(plan(&wanted, &[actual]), Plan::default());
     }
@@ -403,8 +403,8 @@ mod tests {
 
     #[test]
     fn replaces_a_deployment_missing_the_owner_or_capability_flags() {
-        let wanted = wanted(&[("tester", "m", &[ModelTag::Text, ModelTag::Tools])]);
-        let actual = [legacy_row("1", "tester/m", &["text", "tools"])];
+        let wanted = wanted(&[("u-tester", "m", &[ModelTag::Text, ModelTag::Tools])]);
+        let actual = [legacy_row("1", "u-tester/m", &["text", "tools"])];
         let plan = plan(&wanted, &actual);
         assert_eq!(plan.delete, vec!["1".to_owned()]);
         assert_eq!(plan.create.len(), 1);
@@ -412,15 +412,25 @@ mod tests {
 
     #[test]
     fn deletes_duplicates_and_unrecorded_rows() {
-        let wanted = wanted(&[("tester", "m", &[ModelTag::Text])]);
+        let wanted = wanted(&[("u-tester", "m", &[ModelTag::Text])]);
         let actual = [
-            row("1", Some("tester/m"), &["text"]),
-            row("2", Some("tester/m"), &["text"]),
+            row("1", Some("u-tester/m"), &["text"]),
+            row("2", Some("u-tester/m"), &["text"]),
             row("3", None, &[]),
         ];
         let plan = plan(&wanted, &actual);
         assert!(plan.create.is_empty());
         assert_eq!(plan.delete, vec!["2".to_owned(), "3".to_owned()]);
+    }
+
+    #[test]
+    fn replaces_deployments_named_after_the_plain_username() {
+        let wanted = wanted(&[("u-bmz", "m", &[ModelTag::Text])]);
+        let actual = [row("1", Some("bmz/m"), &["text"])];
+        let plan = plan(&wanted, &actual);
+        assert_eq!(plan.delete, vec!["1".to_owned()]);
+        assert_eq!(plan.create.len(), 1);
+        assert_eq!(plan.create[0].client.as_str(), "u-bmz");
     }
 
     #[test]

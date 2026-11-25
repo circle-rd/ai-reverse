@@ -321,7 +321,7 @@ mod tests {
     fn parses_flags_litellm_persisted_as_null() {
         // LiteLLM stores omitted capability flags as JSON null, not as absent keys.
         let list: ModelInfoList = serde_json::from_str(
-            r#"{"data":[{"model_info":{"id":"1","managed_by":"reverse-relay","reverse_name":"bmz/m","created_by":"bmz","tags":["text"],"supports_function_calling":true,"supports_vision":null,"supports_video_input":null,"supports_audio_input":null,"supports_audio_output":null}}]}"#,
+            r#"{"data":[{"model_info":{"id":"1","managed_by":"reverse-relay","reverse_name":"u-bmz/m","created_by":"u-bmz","tags":["text"],"supports_function_calling":true,"supports_vision":null,"supports_video_input":null,"supports_audio_input":null,"supports_audio_output":null}}]}"#,
         )
         .expect("a row with null flags");
         let managed = managed_rows(list);
