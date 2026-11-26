@@ -34,6 +34,54 @@ fn settings(output: &str) -> Value {
 }
 
 #[tokio::test]
+async fn same_host_agents_share_an_owner_only_identity() {
+    let stack = Stack::start(Options {
+        inventory: true,
+        host_identity: true,
+        models: &["alpha"],
+        ..Options::default()
+    })
+    .await;
+    let second = stack.start_second_agent(&["beta"]).await;
+    let log = stack.inventory.as_ref().unwrap().log.clone();
+    let push = eventually("both agents in private inventory", || async {
+        log.pushes().into_iter().find(|push| {
+            let Some(nodes) = push["nodes"].as_array() else {
+                return false;
+            };
+            nodes.len() == 2
+                && nodes
+                    .iter()
+                    .all(|node| node["hardware"]["hostId"].is_string())
+        })
+    })
+    .await;
+    let nodes = push["nodes"].as_array().unwrap();
+    assert_ne!(nodes[0]["nodeId"], nodes[1]["nodeId"]);
+    assert_eq!(
+        nodes[0]["hardware"]["hostId"],
+        nodes[1]["hardware"]["hostId"]
+    );
+    let agent_id =
+        reverse_core::host_identity::HostId::from_machine_id("0123456789abcdef0123456789abcdef")
+            .unwrap();
+    assert_ne!(
+        nodes[0]["hardware"]["hostId"],
+        serde_json::to_value(agent_id).unwrap()
+    );
+    assert_eq!(nodes[0]["hardware"]["hostname"], "test-machine");
+    assert_eq!(nodes[1]["hardware"]["hostname"], "test-machine");
+    for model in ["u-tester/alpha", "u-tester/beta"] {
+        let row = eventually("the deployment", || async { stack.litellm.row(model) }).await;
+        let hardware = &row["model_info"]["hardware"][0];
+        assert!(hardware.get("hostId").is_none());
+        assert!(hardware.get("hostname").is_none());
+    }
+    second.stop().await;
+    stack.shutdown().await;
+}
+
+#[tokio::test]
 async fn the_relay_pushes_its_nodes_signed_with_their_live_status() {
     let stack = Stack::start(with_inventory()).await;
     let log = stack.inventory.as_ref().unwrap().log.clone();

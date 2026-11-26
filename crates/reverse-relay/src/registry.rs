@@ -46,8 +46,9 @@ fn published_hardware<'a>(
     found.sort_by(|a, b| a.0.cmp(b.0));
     let mut published: Vec<HardwareInfo> = Vec::new();
     for (_, hardware) in found {
-        if !published.iter().any(|known| known == hardware) {
-            published.push(hardware.clone());
+        let public = hardware.without_private_identity();
+        if !published.iter().any(|known| known == &public) {
+            published.push(public);
         }
     }
     published
@@ -377,13 +378,17 @@ impl Registry {
     }
 
     /// Records the hardware a connected node reported about its host.
-    pub fn record_hardware(&self, client: &ClientId, node_id: &str, hardware: HardwareInfo) {
+    pub fn record_hardware(&self, client: &ClientId, node_id: &str, mut hardware: HardwareInfo) {
         let mut inner = self.lock();
         if let Some(tunnel) = inner
             .tunnels
             .get_mut(client)
             .and_then(|all| all.iter_mut().find(|t| t.node_id == node_id))
         {
+            hardware.host_id = hardware
+                .host_id
+                .as_ref()
+                .map(|id| id.for_owner(&tunnel.owner_sub));
             tunnel.hardware = Some(hardware);
         }
     }
@@ -631,6 +636,8 @@ mod tests {
     #[test]
     fn published_hardware_lists_each_distinct_machine_serving_the_model_once() {
         let dgx = HardwareInfo {
+            host_id: None,
+            hostname: None,
             kind: HardwareKind::DgxSpark,
             product: Some("NVIDIA DGX Spark".to_owned()),
             vendor: None,
@@ -640,6 +647,8 @@ mod tests {
             cpu_cores: 20,
         };
         let other = HardwareInfo {
+            host_id: None,
+            hostname: None,
             kind: HardwareKind::Other,
             product: None,
             vendor: None,

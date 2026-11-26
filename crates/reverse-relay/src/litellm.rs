@@ -321,6 +321,10 @@ impl LiteLlm {
     ) -> Result<(), LiteLlmError> {
         let name = format!("{client}/{model}");
         let publish = Publish::from_tags(&metadata.tags);
+        let public_hardware: Vec<_> = hardware
+            .iter()
+            .map(HardwareInfo::without_private_identity)
+            .collect();
         let body = NewModel {
             model_name: name.clone(),
             litellm_params: LiteLlmParams {
@@ -339,7 +343,7 @@ impl LiteLlm {
                 hub_owner: metadata.hub_owner.as_deref(),
                 hub_avatar_url: metadata.hub_avatar_url.as_deref(),
                 author_safety_claim: metadata.author_safety_claim,
-                hardware: (!hardware.is_empty()).then_some(hardware),
+                hardware: (!public_hardware.is_empty()).then_some(&public_hardware),
                 reverse_settings: settings,
                 costs: Costs::of(settings),
                 mode: publish.mode,

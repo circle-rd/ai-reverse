@@ -27,6 +27,8 @@ pub fn detect(root: &Path) -> HardwareInfo {
     let gpus = gpu_models(&root.join("proc/driver/nvidia/gpus"));
     let kind = classify(product.as_deref(), &gpus);
     HardwareInfo {
+        host_id: None,
+        hostname: None,
         kind,
         product,
         vendor,

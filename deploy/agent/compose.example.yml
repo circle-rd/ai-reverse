@@ -20,6 +20,8 @@ services:
       - .env
     volumes:
       - agent-state:/var/lib/reverse-agent
+      # For owner-only host grouping, enable AGENT_MACHINE_ID_FILE in .env too.
+      # - /etc/machine-id:/run/host-machine-id:ro
     secrets:
       - upstream_api_key
 

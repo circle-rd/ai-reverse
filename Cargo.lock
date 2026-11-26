@@ -864,6 +864,7 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

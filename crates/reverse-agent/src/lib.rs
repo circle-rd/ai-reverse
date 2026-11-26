@@ -39,7 +39,9 @@ pub async fn run(config: Config, shutdown: watch::Receiver<bool>) {
     let config = Arc::new(config);
     let (snapshots, models) = discovery::channel();
     let upstream = Arc::new(Upstream::new(&config));
-    let info = hardware::collect();
+    let mut info = hardware::collect();
+    info.hardware.host_id.clone_from(&config.host_id);
+    info.hardware.hostname.clone_from(&config.hostname);
     let inflight = Arc::new(AtomicU32::new(0));
     let (benchmark_tx, benchmark_rx) = watch::channel(Benchmark::unknown());
     let (status_tx, status_rx) = watch::channel(AgentStatus::initial());

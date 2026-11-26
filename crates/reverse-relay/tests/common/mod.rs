@@ -98,6 +98,7 @@ pub struct Options {
     pub max_tunnels: Option<&'static str>,
     /// Starts a fake inventory receiver and points the relay at it.
     pub inventory: bool,
+    pub host_identity: bool,
 }
 
 impl Default for Options {
@@ -111,6 +112,7 @@ impl Default for Options {
             max_tunnels_per_user: None,
             max_tunnels: None,
             inventory: false,
+            host_identity: false,
         }
     }
 }
@@ -236,6 +238,15 @@ impl Stack {
         if let Some(tags) = options.model_tags {
             agent_pairs.push(("AGENT_MODEL_TAGS", tags.to_owned()));
         }
+        if options.host_identity {
+            agent_pairs.extend([
+                (
+                    "AGENT_MACHINE_ID",
+                    "0123456789abcdef0123456789abcdef".to_owned(),
+                ),
+                ("AGENT_HOSTNAME", "test-machine".to_owned()),
+            ]);
+        }
         let agent_config = reverse_agent::Config::from_env(&env_of(agent_pairs.clone())).unwrap();
         let (agent_stop, agent_stopped) = reverse_core::shutdown::channel();
         let agent_task = tokio::spawn(reverse_agent::run(agent_config, agent_stopped));
@@ -293,7 +304,7 @@ impl Stack {
     pub async fn start_second_agent(&self, models: &[&str]) -> SecondAgent {
         let engine = FakeEngine::start(ENGINE_KEY, models).await;
         let credential_file = self.credential_file.with_file_name("credential-two");
-        let config = reverse_agent::Config::from_env(&env_of(vec![
+        let mut pairs = vec![
             ("AGENT_RELAY_URL", format!("http://{}", self.relay_tunnel)),
             ("AGENT_AUTH_ISSUER", format!("http://{}", self.idp.addr)),
             ("AGENT_AUTH_CLIENT_ID", "reverse-agent".to_owned()),
@@ -308,8 +319,14 @@ impl Stack {
             ("AGENT_BENCHMARK", "false".into()),
             ("AGENT_HF_METADATA", "true".into()),
             ("AGENT_HF_URL", format!("http://{}", self.hub.addr)),
-        ]))
-        .unwrap();
+        ];
+        pairs.extend(
+            self.agent_pairs
+                .iter()
+                .filter(|(key, _)| *key == "AGENT_MACHINE_ID" || *key == "AGENT_HOSTNAME")
+                .cloned(),
+        );
+        let config = reverse_agent::Config::from_env(&env_of(pairs)).unwrap();
         let (stop, stopped) = reverse_core::shutdown::channel();
         let task = tokio::spawn(reverse_agent::run(config, stopped));
         SecondAgent { engine, stop, task }

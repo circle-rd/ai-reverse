@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use reverse_core::config::{BaseUrl, ConfigError, Env};
+use reverse_core::host_identity::{HostId, HostName};
 use reverse_core::ids::ModelName;
 use reverse_core::secret::SecretString;
 use reverse_core::wire::ModelTag;
@@ -15,6 +16,10 @@ const DEFAULT_HF_URL: &str = "https://huggingface.co";
 /// Everything the agent needs, validated at startup.
 #[derive(Debug)]
 pub struct Config {
+    /// Application-specific pseudonym derived from the host machine id.
+    pub host_id: Option<HostId>,
+    /// Operator-declared hostname, for the owner's inventory only.
+    pub hostname: Option<HostName>,
     /// Where to dial the tunnel.
     pub relay: BaseUrl,
     /// Identity provider that issues the agent's access tokens (CIRCLE auth-service).
@@ -184,6 +189,20 @@ impl Config {
         };
 
         Ok(Self {
+            host_id: env
+                .secret("AGENT_MACHINE_ID")?
+                .map(|value| {
+                    HostId::from_machine_id(value.expose())
+                        .map_err(|error| ConfigError::invalid("AGENT_MACHINE_ID", error))
+                })
+                .transpose()?,
+            hostname: env
+                .optional("AGENT_HOSTNAME")?
+                .map(|value| {
+                    HostName::try_from(value)
+                        .map_err(|error| ConfigError::invalid("AGENT_HOSTNAME", error))
+                })
+                .transpose()?,
             relay,
             auth_issuer,
             auth_client_id,
@@ -375,6 +394,39 @@ mod tests {
     fn upstream_key_comes_from_the_environment_or_a_file() {
         let cfg = load(&with(&[("AGENT_UPSTREAM_API_KEY", "k")])).unwrap();
         assert_eq!(cfg.upstream_api_key.unwrap().expose(), "k");
+    }
+
+    #[test]
+    fn host_identity_is_optional_and_invalid_values_are_rejected() {
+        let cfg = load(&BASE).unwrap();
+        assert!(cfg.host_id.is_none());
+        assert!(cfg.hostname.is_none());
+        let cfg = load(&with(&[
+            ("AGENT_MACHINE_ID", "0123456789abcdef0123456789abcdef"),
+            ("AGENT_HOSTNAME", "test-machine"),
+        ]))
+        .unwrap();
+        assert!(cfg.host_id.is_some());
+        assert!(cfg.hostname.is_some());
+        assert!(load(&with(&[("AGENT_MACHINE_ID", "invalid")])).is_err());
+        assert!(load(&with(&[("AGENT_HOSTNAME", "192.0.2.1")])).is_err());
+    }
+
+    #[test]
+    fn machine_id_file_is_read_and_missing_files_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("machine-id");
+        std::fs::write(&file, "0123456789abcdef0123456789abcdef\n").unwrap();
+        let path = file.to_str().unwrap();
+        let mut pairs = BASE.to_vec();
+        pairs.push(("AGENT_MACHINE_ID_FILE", path));
+        let cfg = load(&pairs).unwrap();
+        assert_eq!(
+            cfg.host_id,
+            Some(HostId::from_machine_id("0123456789abcdef0123456789abcdef").unwrap())
+        );
+        std::fs::remove_file(&file).unwrap();
+        assert!(load(&pairs).is_err());
     }
 
     #[test]

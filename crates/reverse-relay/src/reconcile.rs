@@ -279,6 +279,8 @@ mod tests {
 
     fn gb10() -> HardwareInfo {
         HardwareInfo {
+            host_id: None,
+            hostname: None,
             kind: HardwareKind::DgxSpark,
             product: Some("NVIDIA DGX Spark".to_owned()),
             vendor: None,

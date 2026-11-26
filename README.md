@@ -159,6 +159,8 @@ Required settings have no silent defaults. Supplying both `KEY` and
 | `AGENT_UPSTREAM_API_KEY` | no* | Engine bearer key. |
 | `AGENT_UPSTREAM_API_KEY_FILE` | no* | File alternative; exactly one form per secret. |
 | `AGENT_CREDENTIAL_FILE` | no | Where the refresh token and agent id are kept. Default `/var/lib/reverse-agent/credential`. |
+| `AGENT_MACHINE_ID_FILE` | no | Read-only host machine-id used to derive a private host pseudonym. Mount the host file into containers; do not share an agent credential. |
+| `AGENT_HOSTNAME` | no | Operator-declared local hostname for the owner's private inventory. Never use an IP-derived or reverse-DNS name. |
 | `AGENT_MODELS_POLL_SECS` | no | Interval between engine model-list polls. Default 5. |
 | `AGENT_RECONNECT_MIN_SECS` | no | First reconnect delay. Default 1. |
 | `AGENT_RECONNECT_MAX_SECS` | no | Reconnect delay ceiling. Default 30. |
@@ -328,6 +330,15 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
   relay reads them once per tunnel from `/_agent/info`; an agent without that
   endpoint, or a failed read, publishes no hardware. The facts are not verified:
   consumers must treat them as declarations, never for billing or authorization.
+- **Private host identity.** To correlate agents on one host, give each agent
+  `AGENT_MACHINE_ID_FILE` pointing to the same host `/etc/machine-id`; in a container,
+  bind-mount that file read-only. The agent sends an application-specific pseudonym,
+  never the machine-id itself. The relay scopes it to the verified owner before
+  including `hostId` in the private inventory. `AGENT_HOSTNAME` optionally adds the
+  operator-declared local hostname there. Neither field is sent in LiteLLM model
+  metadata. Do not configure an IP-derived or reverse-DNS hostname. Both fields are
+  self-reported; a restored or cloned machine-id identifies the same host and a
+  replacement machine-id changes the identifier. Existing agents may omit them.
 - The agent also serves its live status at `/_agent/status` through the tunnel
   (never to the public): the engine family and version, its running and queued
   requests and slot capacity, a capacity state (`offline`, `idle`, `busy`,
