@@ -2,18 +2,24 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
 use http::{Method, Request, Response, StatusCode, header};
+use http_body_util::BodyExt;
 use hyper::body::{Body, Incoming};
 use reverse_core::body::{ProxyBody, empty, full, guard};
 use reverse_core::forward::{
     REQUEST_HEADERS, error_response, filter_headers, is_allowed_route, passthrough_response,
 };
-use reverse_core::wire::{AGENT_INFO_PATH, AGENT_MODELS_PATH, AgentInfo, ModelsSnapshot};
+use reverse_core::status::AgentStatus;
+use reverse_core::wire::{
+    AGENT_INFO_PATH, AGENT_MODELS_PATH, AGENT_STATUS_PATH, AgentInfo, ModelsSnapshot,
+};
 use tokio::sync::watch;
 
 use crate::error::UpstreamError;
+use crate::status::InflightGuard;
 use crate::upstream::Upstream;
 
 /// Shared state of every request handler.
@@ -24,6 +30,10 @@ pub struct AgentState {
     pub models: watch::Receiver<ModelsSnapshot>,
     /// Facts about this process and its host.
     pub info: AgentInfo,
+    /// Latest load sample of the engine and the host.
+    pub status: watch::Receiver<AgentStatus>,
+    /// Requests crossing the agent right now.
+    pub inflight: Arc<AtomicU32>,
     /// Largest request body accepted.
     pub max_request_bytes: usize,
     /// Body stall limit in both directions.
@@ -44,6 +54,9 @@ pub async fn handle(
     if method == Method::GET && path == AGENT_INFO_PATH {
         return Ok(json_response(&state.info));
     }
+    if method == Method::GET && path == AGENT_STATUS_PATH {
+        return Ok(json_response(&state.status.borrow().clone()));
+    }
     if !is_allowed_route(&method, &path) {
         return Ok(error_response(
             StatusCode::NOT_FOUND,
@@ -53,6 +66,7 @@ pub async fn handle(
     }
 
     let started = Instant::now();
+    let inflight = InflightGuard::begin(&state.inflight);
     let response = proxy(&state, request, method.clone(), &path).await;
     tracing::info!(
         method = %method,
@@ -61,7 +75,23 @@ pub async fn handle(
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "request.proxied"
     );
-    Ok(response)
+    Ok(counted_until_body_ends(response, inflight))
+}
+
+/// Keeps `inflight` alive until the streamed body is dropped: a completion is in flight until
+/// its last token, not until its first byte.
+fn counted_until_body_ends(
+    response: Response<ProxyBody>,
+    inflight: InflightGuard,
+) -> Response<ProxyBody> {
+    let (parts, body) = response.into_parts();
+    let body = body
+        .map_frame(move |frame| {
+            let _counted = &inflight;
+            frame
+        })
+        .boxed_unsync();
+    Response::from_parts(parts, body)
 }
 
 fn json_response<T: serde::Serialize>(value: &T) -> Response<ProxyBody> {

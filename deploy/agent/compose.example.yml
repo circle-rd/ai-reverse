@@ -5,6 +5,10 @@
 # Non-secret settings come from .env (copy .env.example); the engine key stays in a secret.
 services:
   reverse-agent:
+    # For GPU load, memory, temperature, power and the GPU processes, uncomment `gpus`
+    # (NVIDIA, needs the NVIDIA container toolkit on the host) and `pid: host`; an AMD or
+    # Intel GPU needs `devices: [/dev/dri]` and `group_add: ["<render gid>"]` instead.
+    # Without a GPU the same image runs; the GPU figures stay empty.
     image: ghcr.io/circle-rd/ai-reverse-agent:latest
     restart: unless-stopped
     network_mode: host
@@ -15,6 +19,8 @@ services:
       - .env
     volumes:
       - agent-state:/var/lib/reverse-agent
+      # For owner-only host grouping, enable AGENT_MACHINE_ID_FILE in .env too.
+      # - /etc/machine-id:/run/host-machine-id:ro
     secrets:
       - upstream_api_key
 

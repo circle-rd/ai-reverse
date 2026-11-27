@@ -19,7 +19,7 @@ use tokio::sync::{Semaphore, watch};
 use crate::auth::{AuthState, Identity};
 use crate::error::TunnelError;
 use crate::limiter::{Decision, FailureLimiter};
-use crate::registry::Registry;
+use crate::registry::{NodeIdentity, Registry};
 use crate::watcher;
 
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -200,9 +200,15 @@ async fn run_tunnel(
         .map_err(TunnelError::Handshake)?;
 
     let node_id = identity.node_id();
-    let lease = state
-        .registry
-        .attach(identity.account.clone(), node_id.clone(), sender.clone());
+    let lease = state.registry.attach(
+        identity.account.clone(),
+        NodeIdentity {
+            node_id: node_id.clone(),
+            owner_sub: identity.sub.clone(),
+            agent_id: identity.agent_id.to_string(),
+        },
+        sender.clone(),
+    );
     tracing::info!(user = %identity.account, node_id = %node_id, "tunnel.registered");
     let watcher = watcher::run(
         sender,

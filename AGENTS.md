@@ -102,7 +102,7 @@ services (exception E1).
 | Serialization | `serde` / `serde_json` |
 | Errors | `thiserror` |
 | Logging | `tracing` / `tracing-subscriber` JSON |
-| Container | multi-stage Alpine builder, `scratch` runtime |
+| Container | multi-stage Alpine builder; agent on distroless glibc with nvtop, relay on `scratch` |
 
 The agent has no database, no listener, no admin surface and no shell. The
 relay owns all durable state (accounts, credentials, namespaces) and all
@@ -208,10 +208,12 @@ must be written in English.** No exceptions.
   by `sub`. Agents of the same account that announce the same id share one
   deployment and are pooled by the relay, while distinct ids remain distinct
   aliases.
-- Capability tags resolve in one order: `AGENT_MODEL_TAGS` (operator), then the
-  hub's `pipeline_tag` mapped in `catalog.rs`, then no tag. Never infer tags
-  from the model name: names are not a stable classification and new families
-  would silently misclassify.
+- Capability tags resolve in one order: `AGENT_MODEL_TAGS` (operator override,
+  replaces everything else for the named model), otherwise the union of the
+  engine's own capability endpoints (`capabilities.rs`: Ollama, SGLang, llama.cpp),
+  the `/v1/models` hints, and the hub's `pipeline_tag` mapped in `catalog.rs`; no
+  tag when none applies. Never infer tags from the model name: names are not a
+  stable classification and new families would silently misclassify.
 - Hub lookups are enrichment: bounded by `AGENT_HF_TIMEOUT_SECS`, cached, with a
   negative cache, one bounded pass per discovery cycle so a slow hub cannot
   postpone the announcement of newly discovered models, `AGENT_HF_METADATA=false`
@@ -242,7 +244,7 @@ The blocking gates are the steps `.github/workflows/ci.yml` runs:
 3. **Tests** — `cargo test --workspace --all-targets --all-features --locked`.
 4. **Documentation** — `RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked`.
 5. **Advisories** — `cargo audit`.
-6. **Container** — `docker build -t reverse-agent .`.
+6. **Container** — `docker build -t reverse-agent .` and `docker build -t reverse-relay -f Dockerfile.relay .`.
 
 `[lints.clippy] all = "deny"` and `[lints.rust] unsafe_code = "forbid"` in
 `Cargo.toml` must not be weakened. Warnings are errors. Do not add
@@ -396,12 +398,15 @@ private helpers.
   idle-stall guards apply in both directions.
 - Host facts are self-reported from `/proc` and `/sys` and are treated as
   untrusted text by the consumer.
+- GPU process names come from `/proc/<pid>/comm`; the command line that nvtop
+  prints is never deserialized, because it can carry secrets such as `--api-key`.
 - Model metadata is fetched from the hub only when `AGENT_HF_METADATA` is `true`;
   the request carries the model id and, when set, `AGENT_HF_TOKEN`. Nothing else
   about the box leaves it. Turning the lookup off keeps ids on the box.
-- Runtime image: `scratch`, non-root (UID/GID 65532), read-only root filesystem,
-  no shell, no package manager, `cap_drop: ALL`, `no-new-privileges`, core dumps
-  disabled by the runtime.
+- Runtime images: non-root (UID/GID 65532), read-only root filesystem, no shell, no
+  package manager, `cap_drop: ALL`, `no-new-privileges`, core dumps disabled by the
+  runtime. The relay runs on `scratch`; the agent runs on `distroless/cc-debian13`
+  with nvtop, the documented exception E3.
 - Secrets come from the environment or `*_FILE` variables; supplying both forms
   is rejected. The credential file lives in the writable `/var/lib/reverse-agent`
   volume.
@@ -431,9 +436,12 @@ private helpers.
   (including the `u-` account namespace) live in `crates/reverse-core/src/ids.rs`.
   Update them, their tests and the README in the same change.
 - User-visible behavior changes need tests and documentation in the same change.
-- Release tags are `v*`; both images (agent and relay) publish `nightly` from
+- Release tags are `v*`; the agent and relay images publish `nightly` from
   manual dispatch and semver plus `latest` from tags, for `linux/amd64` and
-  `linux/arm64`.
+  `linux/arm64`. Each release also carries the standalone `deploy.sh` and its
+  `deploy.sh.sha256`; the script discovers local engines, renders the compose file,
+  can install a `systemd --user` unit (`raiversed-agent.service`) and prints the
+  device-flow URL.
 - Keep `AGENTS.md` truthful. If a rule is intentionally violated, document the
   exception in the same change.
 
@@ -473,7 +481,7 @@ Undocumented exceptions are defects.
 1. **Rule relaxed:** no `println!`/`eprintln!` outside entrypoint startup
    errors.
 2. **Why:** the first run needs human approval, so the verification URL and
-   user code must reach the operator's terminal; a `scratch` container has no
+   user code must reach the operator's terminal; a container has no
    browser channel.
 3. **Risk/impact:** stderr may be captured by log shippers.
 4. **Mitigation:** the output carries no secret material — only the identity
@@ -483,3 +491,31 @@ Undocumented exceptions are defects.
    an agent.
 6. **Revisit:** if the identity provider gains an out-of-band channel for
    device codes.
+
+### E3 — The agent image is not `scratch`
+
+1. **Rule relaxed:** the agent's runtime image is `scratch`, with no shell and no
+   package manager (section 8).
+2. **Why:** GPU load, memory, temperature and power, and the processes holding GPU
+   memory, can only be read through the vendor libraries that `nvtop` loads. `nvtop`
+   is a dynamic glibc program, so it cannot run on `scratch`. The processes are visible
+   only with `pid: host`.
+3. **Risk/impact:** the agent image is about 53 MB instead of a static binary, carries
+   glibc and the libraries `nvtop` needs (`libdrm`, `libudev`, `libncursesw`,
+   `libcap`), and ships a GPL-3 binary next to the MIT agent. A CPU-only node carries
+   the same bytes.
+4. **Mitigation:** the runtime is `distroless/cc-debian13`: no shell, no package
+   manager, non-root user, read-only root, `cap_drop: ALL` and `no-new-privileges`.
+   The agent binary is static musl and is the entrypoint. `nvtop` is built from a
+   pinned, checksummed 3.4.0 tarball and runs as a separate process with an empty
+   environment (the agent's credentials are never passed to it). Its licence and
+   source pointer ship in `/usr/share/doc/nvtop`. GPUs are reached through the NVIDIA
+   container toolkit of the host (`gpus: all`, `NVIDIA_DRIVER_CAPABILITIES=utility`)
+   or `/dev/dri`, and the host PID namespace (`pid: host`) names the GPU processes.
+   The relay stays on `scratch`.
+5. **Rejected alternatives:** reading the GPU from the driver in-process (an FFI
+   dependency, and `unsafe_code` is forbidden); keeping a separate GPU image (the
+   agent is a tunnel, not an inference engine, so a CPU-only variant brings no
+   benefit); a Debian slim base with a shell.
+6. **Revisit:** if the engines expose GPU figures themselves, or if nvtop can be built
+   without its system libraries.

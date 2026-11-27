@@ -5,6 +5,7 @@
 pub mod engine;
 pub mod hub;
 pub mod idp;
+pub mod inventory;
 pub mod litellm;
 
 use std::collections::HashMap;
@@ -30,6 +31,7 @@ use tokio::task::JoinHandle;
 pub use engine::FakeEngine;
 pub use hub::FakeHub;
 pub use idp::FakeIdp;
+pub use inventory::{FakeInventory, INVENTORY_SECRET};
 pub use litellm::FakeLiteLlm;
 
 pub type TestBody = BoxBody<Bytes, Infallible>;
@@ -94,6 +96,9 @@ pub struct Options {
     pub model_tags: Option<&'static str>,
     pub max_tunnels_per_user: Option<&'static str>,
     pub max_tunnels: Option<&'static str>,
+    /// Starts a fake inventory receiver and points the relay at it.
+    pub inventory: bool,
+    pub host_identity: bool,
 }
 
 impl Default for Options {
@@ -106,6 +111,8 @@ impl Default for Options {
             model_tags: Some("qwen3.8-27b=text"),
             max_tunnels_per_user: None,
             max_tunnels: None,
+            inventory: false,
+            host_identity: false,
         }
     }
 }
@@ -119,6 +126,7 @@ pub struct Stack {
     pub litellm: FakeLiteLlm,
     pub hub: FakeHub,
     pub idp: FakeIdp,
+    pub inventory: Option<FakeInventory>,
     pub relay_api: SocketAddr,
     pub relay_tunnel: SocketAddr,
     pub credential_file: std::path::PathBuf,
@@ -163,6 +171,11 @@ impl Stack {
         let litellm = FakeLiteLlm::start(LITELLM_KEY).await;
         let hub = FakeHub::start().await;
         let idp = FakeIdp::start("tester", AUDIENCE).await;
+        let inventory = if options.inventory {
+            Some(FakeInventory::start().await)
+        } else {
+            None
+        };
         prepare(&litellm);
 
         let dir = tempfile::tempdir().unwrap();
@@ -182,6 +195,14 @@ impl Stack {
             ("RELAY_CATALOGUE_CLIENT_ID", "reverse-relay".into()),
             ("RELAY_CATALOGUE_CLIENT_SECRET", "relay-secret".into()),
         ];
+        if let Some(inventory) = &inventory {
+            relay_pairs.extend([
+                ("RELAY_INVENTORY_URL", inventory.url()),
+                ("RELAY_INVENTORY_SECRET", INVENTORY_SECRET.to_owned()),
+                ("RELAY_INVENTORY_RELAY_ID", "relay-test".to_owned()),
+                ("RELAY_INVENTORY_INTERVAL_SECS", "1".to_owned()),
+            ]);
+        }
         if let Some(cap) = options.max_tunnels_per_user {
             relay_pairs.push(("RELAY_MAX_TUNNELS_PER_USER", cap.to_owned()));
         }
@@ -207,6 +228,7 @@ impl Stack {
             ("AGENT_UPSTREAM_URL", format!("http://{}", engine.addr)),
             ("AGENT_UPSTREAM_API_KEY", options.agent_key.to_owned()),
             ("AGENT_MODELS_POLL_SECS", "1".to_owned()),
+            ("AGENT_BENCHMARK", "false".to_owned()),
             ("AGENT_HF_METADATA", "true".to_owned()),
             ("AGENT_HF_URL", format!("http://{}", hub.addr)),
         ];
@@ -215,6 +237,15 @@ impl Stack {
         }
         if let Some(tags) = options.model_tags {
             agent_pairs.push(("AGENT_MODEL_TAGS", tags.to_owned()));
+        }
+        if options.host_identity {
+            agent_pairs.extend([
+                (
+                    "AGENT_MACHINE_ID",
+                    "0123456789abcdef0123456789abcdef".to_owned(),
+                ),
+                ("AGENT_HOSTNAME", "test-machine".to_owned()),
+            ]);
         }
         let agent_config = reverse_agent::Config::from_env(&env_of(agent_pairs.clone())).unwrap();
         let (agent_stop, agent_stopped) = reverse_core::shutdown::channel();
@@ -225,6 +256,7 @@ impl Stack {
             litellm,
             hub,
             idp,
+            inventory,
             relay_api,
             relay_tunnel,
             credential_file,
@@ -254,6 +286,7 @@ impl Stack {
             ("AGENT_UPSTREAM_URL", format!("http://{}", self.engine.addr)),
             ("AGENT_UPSTREAM_API_KEY", ENGINE_KEY.into()),
             ("AGENT_MODELS_POLL_SECS", "1".into()),
+            ("AGENT_BENCHMARK", "false".into()),
             ("AGENT_HF_METADATA", "true".into()),
             ("AGENT_HF_URL", format!("http://{}", self.hub.addr)),
         ]))
@@ -271,7 +304,7 @@ impl Stack {
     pub async fn start_second_agent(&self, models: &[&str]) -> SecondAgent {
         let engine = FakeEngine::start(ENGINE_KEY, models).await;
         let credential_file = self.credential_file.with_file_name("credential-two");
-        let config = reverse_agent::Config::from_env(&env_of(vec![
+        let mut pairs = vec![
             ("AGENT_RELAY_URL", format!("http://{}", self.relay_tunnel)),
             ("AGENT_AUTH_ISSUER", format!("http://{}", self.idp.addr)),
             ("AGENT_AUTH_CLIENT_ID", "reverse-agent".to_owned()),
@@ -283,10 +316,17 @@ impl Stack {
             ("AGENT_UPSTREAM_URL", format!("http://{}", engine.addr)),
             ("AGENT_UPSTREAM_API_KEY", ENGINE_KEY.into()),
             ("AGENT_MODELS_POLL_SECS", "1".into()),
+            ("AGENT_BENCHMARK", "false".into()),
             ("AGENT_HF_METADATA", "true".into()),
             ("AGENT_HF_URL", format!("http://{}", self.hub.addr)),
-        ]))
-        .unwrap();
+        ];
+        pairs.extend(
+            self.agent_pairs
+                .iter()
+                .filter(|(key, _)| *key == "AGENT_MACHINE_ID" || *key == "AGENT_HOSTNAME")
+                .cloned(),
+        );
+        let config = reverse_agent::Config::from_env(&env_of(pairs)).unwrap();
         let (stop, stopped) = reverse_core::shutdown::channel();
         let task = tokio::spawn(reverse_agent::run(config, stopped));
         SecondAgent { engine, stop, task }

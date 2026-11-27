@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::host_identity::{HostId, HostName};
+
 /// Protocol token of the HTTP/1.1 upgrade; after it the relay is the HTTP/2 client.
 pub const TUNNEL_PROTOCOL: &str = "reverse-h2/1";
 
@@ -16,6 +18,9 @@ pub const AGENT_MODELS_PATH: &str = "/_agent/models";
 
 /// Path the relay polls through the tunnel to learn what machine the agent runs on.
 pub const AGENT_INFO_PATH: &str = "/_agent/info";
+
+/// Path the relay polls through the tunnel to learn how loaded the agent and its host are.
+pub const AGENT_STATUS_PATH: &str = "/_agent/status";
 
 /// Authority used for requests sent through the tunnel; the connection already picks the peer.
 pub const TUNNEL_AUTHORITY: &str = "reverse-agent";
@@ -34,6 +39,12 @@ pub enum HardwareKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HardwareInfo {
+    /// Owner-scoped host identifier, present only in private inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<HostId>,
+    /// Operator-declared hostname, present only in private inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<HostName>,
     /// The class of machine.
     pub kind: HardwareKind,
     /// DMI product name, e.g. `NVIDIA DGX Spark`.
@@ -48,6 +59,17 @@ pub struct HardwareInfo {
     pub cpu_arch: String,
     /// Logical CPU count.
     pub cpu_cores: u32,
+}
+
+impl HardwareInfo {
+    /// Removes owner-only identity before publishing model metadata.
+    #[must_use]
+    pub fn without_private_identity(&self) -> Self {
+        let mut public = self.clone();
+        public.host_id = None;
+        public.hostname = None;
+        public
+    }
 }
 
 /// Static facts about one agent process, served at [`AGENT_INFO_PATH`].

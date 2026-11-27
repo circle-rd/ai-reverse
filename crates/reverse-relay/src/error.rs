@@ -37,6 +37,29 @@ pub enum NotifyError {
     Status(StatusCode),
 }
 
+/// Pushing the inventory to its receiver failed.
+#[derive(Debug, Error)]
+pub enum InventoryError {
+    /// The HTTP exchange failed.
+    #[error("inventory request failed: {0}")]
+    Http(#[from] reqwest::Error),
+    /// The receiver answered a non-success status.
+    #[error("the inventory receiver answered {0}")]
+    Status(StatusCode),
+    /// The snapshot could not be encoded.
+    #[error("cannot encode the inventory: {0}")]
+    Encode(#[from] serde_json::Error),
+    /// The answer is not what the contract says.
+    #[error("the inventory answer is invalid: {0}")]
+    Answer(String),
+    /// The answer is larger than its cap.
+    #[error("the inventory answer is larger than {0} bytes")]
+    TooLarge(usize),
+    /// The relay's clock is before the Unix epoch.
+    #[error("the system clock is before the Unix epoch")]
+    Clock,
+}
+
 /// The relay could not start.
 #[derive(Debug, Error)]
 pub enum RelayError {
@@ -60,6 +83,9 @@ pub enum RelayError {
     /// The catalogue notifier's HTTP client could not be built.
     #[error("cannot build the catalogue notifier client: {0}")]
     Catalogue(#[source] reqwest::Error),
+    /// The inventory client could not be built.
+    #[error("cannot build the inventory client: {0}")]
+    Inventory(#[source] reqwest::Error),
 }
 
 /// An agent's tunnel could not be established or kept.

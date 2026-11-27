@@ -6,6 +6,7 @@ pub mod catalogue;
 pub mod config;
 pub mod crypto;
 pub mod error;
+pub mod inventory;
 pub mod limiter;
 pub mod litellm;
 pub mod reconcile;
@@ -27,6 +28,7 @@ pub use error::RelayError;
 use crate::api::ApiState;
 use crate::auth::AuthState;
 use crate::catalogue::CatalogueNotifier;
+use crate::inventory::Inventory;
 use crate::limiter::{FailureLimiter, LimiterConfig};
 use crate::litellm::LiteLlm;
 use crate::reconcile::Timing;
@@ -39,6 +41,7 @@ pub struct Relay {
     auth: AuthState,
     litellm: LiteLlm,
     catalogue: Option<CatalogueNotifier>,
+    inventory: Option<Inventory>,
     tunnel_listener: TcpListener,
     api_listener: TcpListener,
 }
@@ -57,11 +60,16 @@ impl Relay {
             ),
             None => None,
         };
+        let inventory = match &config.inventory {
+            Some(inventory) => Some(Inventory::new(inventory).map_err(RelayError::Inventory)?),
+            None => None,
+        };
         Ok(Self {
             config,
             auth,
             litellm,
             catalogue,
+            inventory,
             tunnel_listener,
             api_listener,
         })
@@ -124,6 +132,20 @@ impl Relay {
                 }
             }
         };
+        let inventory_task = {
+            let registry = registry.clone();
+            let stop = shutdown.clone();
+            let inventory = self.inventory;
+            let every = config
+                .inventory
+                .as_ref()
+                .map(|inventory| inventory.interval);
+            async move {
+                if let (Some(inventory), Some(every)) = (inventory, every) {
+                    inventory::run(inventory, registry, every, stop).await;
+                }
+            }
+        };
         tracing::info!(
             tunnel = ?self.tunnel_listener.local_addr().ok(),
             api = ?self.api_listener.local_addr().ok(),
@@ -158,6 +180,7 @@ impl Relay {
             }),
             reconcile::run(registry, self.litellm, timing, catalogue_signal, shutdown,),
             catalogue_task,
+            inventory_task,
         );
         tracing::info!("relay.stopped");
     }

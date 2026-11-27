@@ -1,4 +1,5 @@
-//! Polls a connected agent for the models it serves and, once, for what machine it runs on.
+//! Polls a connected agent for the models it serves, its live status, and, once, for what
+//! machine it runs on.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,8 +8,10 @@ use http::{Method, Request, StatusCode};
 use http_body_util::{BodyExt, Limited};
 use reverse_core::body::empty;
 use reverse_core::ids::{ClientId, ModelName};
+use reverse_core::status::AgentStatus;
 use reverse_core::wire::{
-    AGENT_INFO_PATH, AGENT_MODELS_PATH, AgentInfo, ModelMetadata, ModelsSnapshot, TUNNEL_AUTHORITY,
+    AGENT_INFO_PATH, AGENT_MODELS_PATH, AGENT_STATUS_PATH, AgentInfo, ModelMetadata,
+    ModelsSnapshot, TUNNEL_AUTHORITY,
 };
 use serde::de::DeserializeOwned;
 use tokio::time::{MissedTickBehavior, interval};
@@ -39,6 +42,7 @@ pub async fn run(
             tracing::warn!(client_id = %client, %node_id, %error, "agent.info_failed");
         }
     }
+    let mut status_supported = true;
     let mut failures = 0_u32;
     loop {
         ticker.tick().await;
@@ -53,7 +57,17 @@ pub async fn run(
                 if failures >= MAX_CONSECUTIVE_FAILURES || sender.is_closed() {
                     return;
                 }
+                continue;
             }
+        }
+        if status_supported {
+            let status = fetch_status(&mut sender, request_timeout).await;
+            if matches!(&status, Err(PollError::Status(code)) if *code == StatusCode::NOT_FOUND) {
+                tracing::debug!(client_id = %client, %node_id, "agent.status_unsupported");
+                status_supported = false;
+            }
+            // A failed read is recorded as no status: a stale figure would pass for a live one.
+            registry.record_status(&client, &node_id, status.ok());
         }
     }
 }
@@ -64,6 +78,14 @@ pub async fn fetch_info(
     limit: Duration,
 ) -> Result<AgentInfo, PollError> {
     get_json(sender, AGENT_INFO_PATH, limit).await
+}
+
+/// Asks the agent how loaded it and its host are; agents older than this endpoint answer 404.
+pub async fn fetch_status(
+    sender: &mut TunnelSender,
+    limit: Duration,
+) -> Result<AgentStatus, PollError> {
+    get_json(sender, AGENT_STATUS_PATH, limit).await
 }
 
 async fn poll(
