@@ -437,7 +437,9 @@ private helpers.
 - User-visible behavior changes need tests and documentation in the same change.
 - Release tags are `v*`; the agent, GPU agent and relay images publish `nightly` from
   manual dispatch and semver plus `latest` from tags, for `linux/amd64` and
-  `linux/arm64`.
+  `linux/arm64`. Each release also carries the standalone `deploy.sh` and its
+  `deploy.sh.sha256`; the script discovers local engines, renders the compose file and
+  prints the device-flow URL.
 - Keep `AGENTS.md` truthful. If a rule is intentionally violated, document the
   exception in the same change.
 

@@ -9,6 +9,31 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  deploy-script:
+    name: Publish deploy.sh
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check the script syntax
+        run: bash -n deploy.sh
+
+      - name: Attach deploy.sh to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          sha256sum deploy.sh > deploy.sh.sha256
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" deploy.sh deploy.sh.sha256 --clobber
+          else
+            gh release create "$tag" deploy.sh deploy.sh.sha256 \
+              --title "$tag" --notes "RAIVERSED reverse-agent $tag"
+          fi
+
   build-and-push:
     name: Build & push (${{ matrix.name }})
     runs-on: ubuntu-latest

@@ -90,6 +90,46 @@ flowchart LR
   (`AGENT_HF_URL`) for tags and public owner metadata. Set it to `false` to
   keep model ids on the box; `HTTPS_PROXY`/`NO_PROXY` are honored for this lookup.
 
+## One-command install
+
+`deploy.sh` is attached to each release. It checks the host, finds the local
+OpenAI-compatible servers, asks which one to expose when several are running, writes
+`compose.yml` and `.env`, pulls the image, starts the agent and prints the device-flow
+link.
+
+```bash
+curl -fsSL https://github.com/circle-rd/ai-reverse/releases/latest/download/deploy.sh -o deploy.sh
+chmod +x deploy.sh
+sudo ./deploy.sh
+```
+
+Requirements:
+
+- Linux on `amd64` or `arm64`; Ubuntu and Debian are tested, and another Linux with
+  Docker works as long as the script's tools are present.
+- Docker Engine 20.10 or newer with the Compose v2 plugin (2.20 or newer), and
+  `curl`, `ss` (iproute2) and the usual coreutils. Run the script as root or as a
+  member of the `docker` group; process names in the server list require root.
+- Outbound HTTPS to the relay, the identity provider, and optionally the Hugging Face
+  hub. If the GHCR packages are private, run `docker login ghcr.io` first.
+- An OpenAI-compatible inference server listening on a local TCP port. The script probes
+  `/v1/models`; a single answer is selected automatically, several answers are shown as a
+  numbered list.
+- GPU metrics are optional. NVIDIA needs the NVIDIA Container Toolkit on the host (the
+  script refuses to continue if a GPU is present but the toolkit is not configured); AMD
+  and Intel use `/dev/dri`. The `-gpu` image ships nvtop 3.4.
+
+The script accepts `--relay URL`, `--issuer URL`, `--client-id ID`, `--engine-key-file
+FILE` and `--install-dir DIR`; without `--relay` and `--issuer` it prompts, or reuses the
+existing `.env`. `--auto --model NAME` is the non-interactive form: it selects the server
+serving `NAME` and prints only the enrolment URL on stdout. Without `--model`, `--auto`
+accepts a single detected server and fails on an ambiguous host. `--dry-run` shows the
+generated files without changing the host.
+
+The one-command path requires an OpenAI-compatible engine already running. It does not
+install an engine, Docker or the NVIDIA Container Toolkit. See the manual quickstart
+below for a pre-written compose file.
+
 ## Quickstart (container)
 
 ```bash
