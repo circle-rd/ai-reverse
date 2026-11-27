@@ -9,7 +9,6 @@ IFS=$'\n\t'
 
 readonly SCRIPT_NAME="deploy.sh"
 readonly AGENT_IMAGE="ghcr.io/circle-rd/ai-reverse-agent:${RAIVERSED_IMAGE_TAG:-latest}"
-readonly GPU_IMAGE="ghcr.io/circle-rd/ai-reverse-agent-gpu:${RAIVERSED_IMAGE_TAG:-latest}"
 readonly DEFAULT_RELAY="https://relay.circle-cyber.com"
 readonly DEFAULT_ISSUER="https://auth.circle-cyber.com"
 readonly DEFAULT_CLIENT_ID="reverse-agent"
@@ -35,6 +34,7 @@ INSECURE=0
 DRY_RUN=0
 RECONFIGURE=0
 SKIP_PULL=0
+USER_SERVICE=0
 PROMPT_ANSWER=""
 SELECTED_PORT=""
 SELECTED_PROCESS=""
@@ -75,10 +75,11 @@ Usage: $SCRIPT_NAME [options]
   --engine-key-file FILE engine bearer key, stored as a Docker secret
   --secret KEY           engine bearer key (visible in the shell history; prefer
                          --engine-key-file or AGENT_UPSTREAM_API_KEY)
-  --gpu / --no-gpu       force or disable the GPU image and device access
+  --gpu / --no-gpu       force or disable GPU device access (the image is the same)
   --insecure             allow plain HTTP to a non-loopback relay or issuer
   --reconfigure          rediscover the engine even if a deployment exists
   --no-pull              use a local image without pulling it
+  --user-service         install and start raiversed-agent.service with systemd --user
   --dry-run              show the detected server and generated files, change nothing
   -h, --help             this help
 
@@ -117,6 +118,7 @@ while [ $# -gt 0 ]; do
         --insecure) INSECURE=1 ;;
         --reconfigure) RECONFIGURE=1 ;;
         --no-pull) SKIP_PULL=1 ;;
+        --user-service) USER_SERVICE=1 ;;
         --dry-run) DRY_RUN=1 ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1 (try --help)" ;;
@@ -125,6 +127,7 @@ while [ $# -gt 0 ]; do
 done
 [ "$FORCE_GPU" -eq 1 ] && [ "$NO_GPU" -eq 1 ] && die "--gpu and --no-gpu are exclusive"
 [ -n "$ENGINE_KEY_FILE" ] && [ -n "$ENGINE_SECRET" ] && die "--engine-key-file and --secret are exclusive"
+[ "$USER_SERVICE" -eq 1 ] && [ "$(id -u)" -eq 0 ] && die "--user-service must run as the target user, not root"
 
 banner() {
     [ "$AUTO" -eq 1 ] && return
@@ -176,6 +179,12 @@ check_prereqs() {
         || die "Docker Engine $MIN_DOCKER or newer is required (found $docker_version)"
     version_ge "$compose_version" "$MIN_COMPOSE" \
         || die "Docker Compose $MIN_COMPOSE or newer is required (found $compose_version)"
+    if [ "$USER_SERVICE" -eq 1 ]; then
+        command -v systemctl >/dev/null 2>&1 || die "systemd is required for --user-service"
+        command -v loginctl >/dev/null 2>&1 || die "loginctl is required for --user-service"
+        systemctl --user show-environment >/dev/null 2>&1 \
+            || die "no systemd user manager; log in normally or use a system service"
+    fi
 }
 
 env_value() {
@@ -437,9 +446,7 @@ detect_gpu() {
 
 write_config() {
     step "Writing configuration"
-    [ -n "$IMAGE" ] || {
-        if [ "$GPU" = "none" ]; then IMAGE=$AGENT_IMAGE; else IMAGE=$GPU_IMAGE; fi
-    }
+    [ -n "$IMAGE" ] || IMAGE=$AGENT_IMAGE
     HOSTNAME_VALUE=$(env_value AGENT_HOSTNAME)
     [ -n "$HOSTNAME_VALUE" ] || HOSTNAME_VALUE=$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)
     case "$HOSTNAME_VALUE" in
@@ -516,12 +523,19 @@ write_config() {
         printf 'volumes:\n  agent-state:\n'
         [ "$SECRET" -eq 1 ] && printf 'secrets:\n  upstream_api_key:\n    file: ./secrets/upstream_api_key\n'
     } >"$WORK_DIR/compose.yml"
+    if [ "$USER_SERVICE" -eq 1 ]; then
+        write_user_unit
+    fi
 
     if [ "$DRY_RUN" -eq 1 ]; then
         printf '\n%s--- %s/compose.yml ---%s\n' "$DIM" "$INSTALL_DIR" "$RESET"
         cat "$WORK_DIR/compose.yml"
         printf '\n%s--- %s/.env (secrets omitted) ---%s\n' "$DIM" "$INSTALL_DIR" "$RESET"
         sed 's/^AGENT_UPSTREAM_API_KEY_FILE=.*/AGENT_UPSTREAM_API_KEY_FILE=<secret>/' "$WORK_DIR/env"
+        if [ "$USER_SERVICE" -eq 1 ]; then
+            printf '\n%s--- %s ---%s\n' "$DIM" "$(unit_path)" "$RESET"
+            cat "$WORK_DIR/raiversed-agent.service"
+        fi
         exit 0
     fi
 
@@ -536,6 +550,28 @@ write_config() {
     say "  Image:      $IMAGE"
 }
 
+unit_path() {
+    printf '%s/systemd/user/raiversed-agent.service' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+write_user_unit() {
+    docker_bin=$(command -v docker)
+    {
+        printf '[Unit]\n'
+        printf 'Description=RAIVERSED reverse-agent\n\n'
+        printf '[Service]\n'
+        printf 'Type=simple\n'
+        printf 'WorkingDirectory=%s\n' "$INSTALL_DIR"
+        printf 'ExecStart=%s compose up\n' "$docker_bin"
+        printf 'ExecStop=%s compose down\n' "$docker_bin"
+        printf 'Restart=on-failure\n'
+        printf 'RestartSec=10\n'
+        printf 'TimeoutStopSec=30\n\n'
+        printf '[Install]\n'
+        printf 'WantedBy=default.target\n'
+    } >"$WORK_DIR/raiversed-agent.service"
+}
+
 run_compose() {
     if [ "$AUTO" -eq 1 ]; then
         (cd "$INSTALL_DIR" && "$@" >>"$LOG_FILE" 2>&1) \
@@ -545,6 +581,28 @@ run_compose() {
     fi
 }
 
+run_service() {
+    if [ "$AUTO" -eq 1 ]; then
+        "$@" >>"$LOG_FILE" 2>&1 || die "systemd command failed: $*; see $LOG_FILE"
+    else
+        "$@"
+    fi
+}
+
+install_user_unit() {
+    unit=$(unit_path)
+    install -d -m 755 "$(dirname "$unit")" || die "cannot create $(dirname "$unit")"
+    install -m 644 "$WORK_DIR/raiversed-agent.service" "$unit" || die "cannot install $unit"
+    run_service systemctl --user daemon-reload
+    run_service systemctl --user enable raiversed-agent.service
+    if ! loginctl show-user "$(id -un)" -p Linger 2>/dev/null | grep -q 'Linger=yes'; then
+        loginctl enable-linger "$(id -un)" >/dev/null 2>&1 \
+            || warn "linger is not enabled; the service starts at login only"
+    fi
+    run_service systemctl --user restart raiversed-agent.service
+    say "  Service:    $unit"
+}
+
 start_agent() {
     step "Starting the agent"
     LOG_FILE="$INSTALL_DIR/deploy.log"
@@ -552,7 +610,27 @@ start_agent() {
     chmod 600 "$LOG_FILE"
     LOG_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     [ "$SKIP_PULL" -eq 1 ] || run_compose docker compose pull
-    run_compose docker compose up -d --force-recreate
+    if [ "$USER_SERVICE" -eq 1 ]; then
+        install_user_unit
+    else
+        run_compose docker compose up -d --force-recreate
+    fi
+    wait_for_container
+}
+
+wait_for_container() {
+    n=0
+    while [ "$n" -lt 20 ]; do
+        if docker inspect -f '{{.State.Running}}' reverse-agent 2>/dev/null | grep -q true; then
+            return 0
+        fi
+        sleep 1
+        n=$((n + 1))
+    done
+    if [ "$USER_SERVICE" -eq 1 ]; then
+        systemctl --user status raiversed-agent.service --no-pager >&2 2>/dev/null || true
+    fi
+    die "the agent container did not start; see $LOG_FILE"
 }
 
 wait_for_enrolment() {
@@ -606,18 +684,13 @@ check_identity
 detect_gpu
 write_config
 
+start_agent
+set +e
+wait_for_enrolment
+result=$?
+set -e
+
 if [ "$AUTO" -eq 1 ]; then
-    step "Starting the agent"
-    LOG_FILE="$INSTALL_DIR/deploy.log"
-    : >"$LOG_FILE"
-    chmod 600 "$LOG_FILE"
-    LOG_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    [ "$SKIP_PULL" -eq 1 ] || run_compose docker compose pull
-    run_compose docker compose up -d --force-recreate
-    set +e
-    wait_for_enrolment
-    result=$?
-    set -e
     case "$result" in
         0) printf '%s\n' "$ENROL_URL" ;;
         2) ;;
@@ -625,12 +698,6 @@ if [ "$AUTO" -eq 1 ]; then
     esac
     exit 0
 fi
-
-start_agent
-set +e
-wait_for_enrolment
-result=$?
-set -e
 case "$result" in
     0)
         printf '\n%sAuthorization required%s\n' "$CYAN" "$RESET"

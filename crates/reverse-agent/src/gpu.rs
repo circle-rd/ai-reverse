@@ -2,7 +2,7 @@
 //! NVTOP monitor.
 //!
 //! One tool covers NVIDIA (x86 and ARM), AMD and Intel with one format. The agent runs the
-//! first `nvtop` on its `PATH`: the GPU image ships the one it needs, and a natively installed
+//! first `nvtop` on its `PATH`: the agent image ships the one it needs, and a natively installed
 //! agent uses the host's. A container cannot borrow the host's binary, which is linked against
 //! the host's libraries.
 //!
@@ -70,7 +70,7 @@ async fn snapshot() -> io::Result<String> {
     let mut command = Command::new(NVTOP);
     // The agent's environment holds its credentials; the tool needs none of it. The search path
     // is set explicitly: without it the lookup falls back to /bin:/usr/bin, which misses the
-    // /usr/local/bin install of the GPU image.
+    // /usr/local/bin install of the agent image.
     command
         .arg("-s")
         .env_clear()

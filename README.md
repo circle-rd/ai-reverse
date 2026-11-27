@@ -73,9 +73,9 @@ flowchart LR
   path segment can occupy.
 - Request bodies are bounded (64 MiB default) with idle stall guards in both
   directions.
-- The runtime image is `scratch`, non-root (UID/GID 65532), read-only, with no
-  shell, no package manager, `cap_drop: ALL` and `no-new-privileges`. The optional
-  `-gpu` image trades `scratch` for Debian 13 slim to carry nvtop (AGENTS.md, E3).
+- The runtime images are non-root (UID/GID 65532), read-only, with no shell, no
+  package manager, `cap_drop: ALL` and `no-new-privileges`. The agent runs on
+  distroless glibc to carry nvtop; the relay stays on `scratch` (AGENTS.md, E3).
 
 ## Requirements
 
@@ -119,7 +119,7 @@ Requirements:
   numbered list.
 - GPU metrics are optional. NVIDIA needs the NVIDIA Container Toolkit on the host (the
   script refuses to continue if a GPU is present but the toolkit is not configured); AMD
-  and Intel use `/dev/dri`. The `-gpu` image ships nvtop 3.4.
+  and Intel use `/dev/dri`. The agent image ships nvtop 3.4.
 
 It defaults to the official endpoints: relay `https://relay.circle-cyber.com`,
 identity provider `https://auth.circle-cyber.com` and client id `reverse-agent`. Override
@@ -136,6 +136,30 @@ without changing the host.
 The one-command path requires an OpenAI-compatible engine already running. It does not
 install an engine, Docker or the NVIDIA Container Toolkit. See the manual quickstart
 below for a pre-written compose file.
+
+### User service
+
+By default the deployment is a Compose project with `restart: unless-stopped`; no
+systemd unit is installed. `--user-service` installs `raiversed-agent.service` in the
+current user's systemd manager:
+
+```bash
+./deploy.sh --user-service --auto --model qwen3.8-27b
+```
+
+Run it as the target user, never with `sudo`. The unit lives in
+`~/.config/systemd/user/raiversed-agent.service`, is enabled in `default.target`, and
+starts the Compose project in the foreground. `loginctl enable-linger` is attempted so
+the service starts at boot without a login; if polkit refuses it, the service starts at
+login only and a one-time `sudo loginctl enable-linger "$USER"` is needed. Manage it with
+`systemctl --user status raiversed-agent.service` and
+`journalctl --user -u raiversed-agent.service`.
+
+This is user-only for systemd and for the deployment files, but Docker access still
+comes from the `docker` group, which is root-equivalent on the host. A fully rootless
+Docker daemon is a different setup: `network_mode: host` and GPU access are not
+validated in that mode, so a GPU node should use a user in the `docker` group or a
+system-wide service.
 
 ## Quickstart (container)
 
@@ -414,7 +438,7 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
     Without engine metrics the load falls back to the requests crossing the agent.
   - **GPU figures** come from `nvtop -s` (NVIDIA on x86 and ARM, AMD, Intel), run by
     the agent with an empty environment. It uses the first `nvtop` on its `PATH`: an
-    agent installed natively uses the host's, and the `-gpu` image uses the 3.4.0 it
+    agent installed natively uses the host's, and the container image uses the 3.4.0 it
     ships (below). A container cannot borrow the host's binary, which is linked
     against the host's libraries. Without `nvtop`, or without GPU access, `gpus` is
     empty. Values are device-wide, so a container reports what the host would, with
@@ -462,7 +486,6 @@ the box.
 ## Container images
 
 The workflows publish `ghcr.io/circle-rd/ai-reverse-agent` (`Dockerfile`),
-`ghcr.io/circle-rd/ai-reverse-agent-gpu` (`Dockerfile`, target `gpu`) and
 `ghcr.io/circle-rd/ai-reverse-relay` (`Dockerfile.relay`) for `linux/amd64` and
 `linux/arm64`:
 
@@ -473,17 +496,18 @@ The workflows publish `ghcr.io/circle-rd/ai-reverse-agent` (`Dockerfile`),
 
 Pin the image by digest in production.
 
-### GPU image
+### Agent image
 
-`ai-reverse-agent-gpu` is the same agent on Debian 13 slim next to nvtop 3.4.0 (built
-from a pinned, checksummed release; GPL-3, licence and source pointer in
+`ai-reverse-agent` runs the agent on distroless glibc next to nvtop 3.4.0 (built from a
+pinned, checksummed release; GPL-3, licence and source pointer in
 `/usr/share/doc/nvtop`), so the status carries GPU load, memory, temperature and power
-(AGENTS.md, exception E3). It keeps the non-root user, read-only root and
-`cap_drop: ALL`. Give it the GPU with `gpus: all` (the image already sets
-`NVIDIA_DRIVER_CAPABILITIES=utility`); for an AMD or Intel GPU pass `/dev/dri` and the
-`render` group instead. Add `pid: host` so nvtop lists the GPU processes of the host.
-The NVIDIA container toolkit must be installed on the host: it injects the driver
-libraries that nvtop reads, they are not in the image. See
+(AGENTS.md, exception E3). It has no shell and no package manager, and keeps the
+non-root user, read-only root and `cap_drop: ALL`. Give it the GPU with `gpus: all` (the
+image already sets `NVIDIA_DRIVER_CAPABILITIES=utility`); for an AMD or Intel GPU pass
+`/dev/dri` and the `render` group instead. Add `pid: host` so nvtop lists the GPU
+processes of the host. The NVIDIA container toolkit must be installed on the host: it
+injects the driver libraries that nvtop reads, they are not in the image. Without a GPU
+the same image runs, and the GPU figures stay empty. See
 `deploy/agent/compose.example.yml`.
 
 ## Run with Cargo

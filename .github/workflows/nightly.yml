@@ -25,9 +25,6 @@ jobs:
         include:
           - name: agent
             dockerfile: Dockerfile
-          - name: agent-gpu
-            dockerfile: Dockerfile
-            target: gpu
           - name: relay
             dockerfile: Dockerfile.relay
     env:
@@ -71,7 +68,6 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          target: ${{ matrix.target }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly
