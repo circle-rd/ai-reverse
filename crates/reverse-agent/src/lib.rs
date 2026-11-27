@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod benchmark;
+pub mod capabilities;
 pub mod catalog;
 pub mod config;
 pub mod credential;

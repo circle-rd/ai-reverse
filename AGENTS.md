@@ -208,10 +208,12 @@ must be written in English.** No exceptions.
   by `sub`. Agents of the same account that announce the same id share one
   deployment and are pooled by the relay, while distinct ids remain distinct
   aliases.
-- Capability tags resolve in one order: `AGENT_MODEL_TAGS` (operator), then the
-  hub's `pipeline_tag` mapped in `catalog.rs`, then no tag. Never infer tags
-  from the model name: names are not a stable classification and new families
-  would silently misclassify.
+- Capability tags resolve in one order: `AGENT_MODEL_TAGS` (operator override,
+  replaces everything else for the named model), otherwise the union of the
+  engine's own capability endpoints (`capabilities.rs`: Ollama, SGLang, llama.cpp),
+  the `/v1/models` hints, and the hub's `pipeline_tag` mapped in `catalog.rs`; no
+  tag when none applies. Never infer tags from the model name: names are not a
+  stable classification and new families would silently misclassify.
 - Hub lookups are enrichment: bounded by `AGENT_HF_TIMEOUT_SECS`, cached, with a
   negative cache, one bounded pass per discovery cycle so a slow hub cannot
   postpone the announcement of newly discovered models, `AGENT_HF_METADATA=false`
@@ -396,6 +398,8 @@ private helpers.
   idle-stall guards apply in both directions.
 - Host facts are self-reported from `/proc` and `/sys` and are treated as
   untrusted text by the consumer.
+- GPU process names come from `/proc/<pid>/comm`; the command line that nvtop
+  prints is never deserialized, because it can carry secrets such as `--api-key`.
 - Model metadata is fetched from the hub only when `AGENT_HF_METADATA` is `true`;
   the request carries the model id and, when set, `AGENT_HF_TOKEN`. Nothing else
   about the box leaves it. Turning the lookup off keeps ids on the box.
@@ -488,9 +492,10 @@ Undocumented exceptions are defects.
 
 1. **Rule relaxed:** the runtime image is `scratch`, with no shell and no package
    manager (section 8).
-2. **Why:** GPU load, memory, temperature and power can only be read through the
-   vendor libraries that `nvtop` loads, and `nvtop` is a dynamic glibc program that
-   cannot run on `scratch`.
+2. **Why:** GPU load, memory, temperature and power, and the processes holding
+   GPU memory, can only be read through the vendor libraries that `nvtop` loads, and
+   `nvtop` is a dynamic glibc program that cannot run on `scratch`. The processes are
+   visible only with `pid: host`.
 3. **Risk/impact:** a larger image (Debian 13 slim, about 90 MB) with a shell, a
    package database and the system libraries `nvtop` needs, and a GPL-3 binary
    shipped next to the MIT agent.
@@ -500,7 +505,9 @@ Undocumented exceptions are defects.
    arm64 and amd64). `nvtop` is built from a pinned, checksummed release tarball,
    runs as a separate process with an empty environment (the agent's credentials
    are never passed to it), and its licence and source pointer ship in
-   `/usr/share/doc/nvtop`.
+   `/usr/share/doc/nvtop`. The variant runs on Debian 13 slim, uses the NVIDIA
+   container toolkit of the host (`gpus: all`, `NVIDIA_DRIVER_CAPABILITIES=utility`)
+   and the host PID namespace (`pid: host`) to name GPU processes.
 5. **Rejected alternative:** reading the GPU from the driver in-process (an FFI
    dependency, and `unsafe_code` is forbidden), and adding `nvtop` to the default
    image (impossible on `scratch`).
