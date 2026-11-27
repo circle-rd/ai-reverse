@@ -10,6 +10,8 @@ IFS=$'\n\t'
 readonly SCRIPT_NAME="deploy.sh"
 readonly AGENT_IMAGE="ghcr.io/circle-rd/ai-reverse-agent:${RAIVERSED_IMAGE_TAG:-latest}"
 readonly GPU_IMAGE="ghcr.io/circle-rd/ai-reverse-agent-gpu:${RAIVERSED_IMAGE_TAG:-latest}"
+readonly DEFAULT_RELAY="https://relay.circle-cyber.com"
+readonly DEFAULT_ISSUER="https://auth.circle-cyber.com"
 readonly DEFAULT_CLIENT_ID="reverse-agent"
 readonly ENROLL_TIMEOUT="${RAIVERSED_ENROLL_TIMEOUT:-120}"
 readonly APPROVAL_TIMEOUT="${RAIVERSED_APPROVAL_TIMEOUT:-300}"
@@ -25,6 +27,8 @@ CLIENT_ID=""
 INSTALL_DIR=""
 IMAGE=""
 ENGINE_KEY_FILE=""
+ENGINE_SECRET=""
+ENGINE_KEY_SOURCE=""
 FORCE_GPU=0
 NO_GPU=0
 INSECURE=0
@@ -63,12 +67,14 @@ Usage: $SCRIPT_NAME [options]
   --auto                 non-interactive: print only the enrolment URL on stdout
   --model NAME           select the server that serves NAME (with --auto)
   --upstream URL         use this engine instead of discovering one
-  --relay URL            relay origin (default: prompt, or the existing .env)
-  --issuer URL           identity-provider origin (default: prompt, or existing)
+  --relay URL            relay origin (default: $DEFAULT_RELAY)
+  --issuer URL           identity-provider origin (default: $DEFAULT_ISSUER)
   --client-id ID         OAuth device-flow client id (default: $DEFAULT_CLIENT_ID)
   --install-dir DIR      deployment directory (default: /opt/reverse-agent as root)
   --image IMAGE          override the container image
   --engine-key-file FILE engine bearer key, stored as a Docker secret
+  --secret KEY           engine bearer key (visible in the shell history; prefer
+                         --engine-key-file or AGENT_UPSTREAM_API_KEY)
   --gpu / --no-gpu       force or disable the GPU image and device access
   --insecure             allow plain HTTP to a non-loopback relay or issuer
   --reconfigure          rediscover the engine even if a deployment exists
@@ -105,6 +111,7 @@ while [ $# -gt 0 ]; do
         --install-dir) INSTALL_DIR="${2:?--install-dir needs a value}"; shift ;;
         --image) IMAGE="${2:?--image needs a value}"; shift ;;
         --engine-key-file) ENGINE_KEY_FILE="${2:?--engine-key-file needs a value}"; shift ;;
+        --secret) ENGINE_SECRET="${2:?--secret needs a value}"; shift ;;
         --gpu) FORCE_GPU=1 ;;
         --no-gpu) NO_GPU=1 ;;
         --insecure) INSECURE=1 ;;
@@ -117,6 +124,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 [ "$FORCE_GPU" -eq 1 ] && [ "$NO_GPU" -eq 1 ] && die "--gpu and --no-gpu are exclusive"
+[ -n "$ENGINE_KEY_FILE" ] && [ -n "$ENGINE_SECRET" ] && die "--engine-key-file and --secret are exclusive"
 
 banner() {
     [ "$AUTO" -eq 1 ] && return
@@ -130,22 +138,6 @@ banner() {
 EOF
     printf '%s' "$RESET"
     printf '%s  PRIVATE P2P AI PROVIDER - OFFICIAL TUNNEL%s\n' "$DIM" "$RESET"
-}
-
-prompt_value() {
-    label=$1
-    default=$2
-    if [ -n "$default" ]; then
-        printf '%s [%s]: ' "$label" "$default"
-    else
-        printf '%s: ' "$label"
-    fi
-    if [ -r /dev/tty ]; then
-        IFS= read -r PROMPT_ANSWER < /dev/tty
-    else
-        IFS= read -r PROMPT_ANSWER
-    fi
-    [ -z "$PROMPT_ANSWER" ] && PROMPT_ANSWER=$default
 }
 
 version_ge() {
@@ -363,19 +355,11 @@ select_candidate() {
 resolve_settings() {
     step "Configuring the tunnel"
     [ -n "$RELAY" ] || RELAY=$(env_value AGENT_RELAY_URL)
+    [ -n "$RELAY" ] || RELAY=$DEFAULT_RELAY
     [ -n "$ISSUER" ] || ISSUER=$(env_value AGENT_AUTH_ISSUER)
+    [ -n "$ISSUER" ] || ISSUER=$DEFAULT_ISSUER
     [ -n "$CLIENT_ID" ] || CLIENT_ID=$(env_value AGENT_AUTH_CLIENT_ID)
     [ -n "$CLIENT_ID" ] || CLIENT_ID=$DEFAULT_CLIENT_ID
-    if [ -z "$RELAY" ]; then
-        [ "$AUTO" -eq 1 ] && die "AGENT_RELAY_URL is required (pass --relay)"
-        prompt_value "Relay URL" ""
-        RELAY=$PROMPT_ANSWER
-    fi
-    if [ -z "$ISSUER" ]; then
-        [ "$AUTO" -eq 1 ] && die "AGENT_AUTH_ISSUER is required (pass --issuer)"
-        prompt_value "Identity provider URL" ""
-        ISSUER=$PROMPT_ANSWER
-    fi
     RELAY=$(normalize_url "$RELAY")
     ISSUER=$(normalize_url "$ISSUER")
     validate_url "AGENT_RELAY_URL" "$RELAY"
@@ -389,23 +373,49 @@ resolve_settings() {
 load_engine_key() {
     SECRET=0
     ENGINE_KEY=""
+    ENGINE_KEY_SOURCE=""
     if [ -n "$ENGINE_KEY_FILE" ]; then
         [ -r "$ENGINE_KEY_FILE" ] || die "cannot read $ENGINE_KEY_FILE"
         ENGINE_KEY=$(cat "$ENGINE_KEY_FILE")
+        ENGINE_KEY_SOURCE='file'
+        SECRET=1
+    elif [ -n "$ENGINE_SECRET" ]; then
+        ENGINE_KEY=$ENGINE_SECRET
+        ENGINE_KEY_SOURCE='arg'
         SECRET=1
     elif [ -n "${AGENT_UPSTREAM_API_KEY:-}" ]; then
         ENGINE_KEY=$AGENT_UPSTREAM_API_KEY
+        ENGINE_KEY_SOURCE='env'
         SECRET=1
     elif [ -s "$INSTALL_DIR/secrets/upstream_api_key" ]; then
         ENGINE_KEY=$(cat "$INSTALL_DIR/secrets/upstream_api_key")
+        ENGINE_KEY_SOURCE='existing'
         SECRET=1
     elif [ -n "$(env_value AGENT_UPSTREAM_API_KEY)" ]; then
         ENGINE_KEY=$(env_value AGENT_UPSTREAM_API_KEY)
+        ENGINE_KEY_SOURCE='inline'
     fi
     if [ -n "$ENGINE_KEY" ]; then
         case "$ENGINE_KEY" in
             *$'\n'*|*'"'*) die "the engine key must be a single line without quotes" ;;
         esac
+    fi
+}
+
+check_identity() {
+    step "Checking the identity provider"
+    discovery=$(curl -fsS --max-time 10 "$ISSUER/.well-known/openid-configuration" 2>/dev/null) \
+        || die "cannot read $ISSUER/.well-known/openid-configuration"
+    endpoint=$(printf '%s' "$discovery" | sed -n 's/.*"device_authorization_endpoint":"\([^"]*\)".*/\1/p')
+    [ -n "$endpoint" ] || die "$ISSUER does not advertise a device authorization endpoint"
+    status=$(curl -sS -o "$WORK_DIR/device.json" -w '%{http_code}' --max-time 10 \
+        -X POST "$endpoint" -H "content-type: application/x-www-form-urlencoded" \
+        --data-urlencode "client_id=$CLIENT_ID" \
+        --data-urlencode "scope=$SCOPE" \
+        --data-urlencode "resource=$RESOURCE" 2>/dev/null || printf '000')
+    if [ "$status" != "200" ]; then
+        detail=$(sed -n 's/.*"error_description":"\([^"]*\)".*/\1/p' "$WORK_DIR/device.json" 2>/dev/null)
+        die "the device-flow client '$CLIENT_ID' was refused (HTTP $status${detail:+: $detail}); register it as a public client (token_endpoint_auth_method=none) or pass --client-id"
     fi
 }
 
@@ -515,14 +525,10 @@ write_config() {
         exit 0
     fi
 
-    if [ -n "$ENGINE_KEY" ]; then
-        if [ -n "$ENGINE_KEY_FILE" ]; then
-            install -m 600 "$ENGINE_KEY_FILE" "$INSTALL_DIR/secrets/upstream_api_key"
-        elif [ -n "${AGENT_UPSTREAM_API_KEY:-}" ]; then
-            printf '%s' "$AGENT_UPSTREAM_API_KEY" >"$INSTALL_DIR/secrets/upstream_api_key"
-            chmod 600 "$INSTALL_DIR/secrets/upstream_api_key"
-        fi
-    fi
+    case "$ENGINE_KEY_SOURCE" in
+        file) install -m 600 "$ENGINE_KEY_FILE" "$INSTALL_DIR/secrets/upstream_api_key" ;;
+        arg|env) printf '%s' "$ENGINE_KEY" >"$INSTALL_DIR/secrets/upstream_api_key"; chmod 600 "$INSTALL_DIR/secrets/upstream_api_key" ;;
+    esac
     install -m 600 "$WORK_DIR/env" "$INSTALL_DIR/.env"
     install -m 644 "$WORK_DIR/compose.yml" "$INSTALL_DIR/compose.yml"
     say "  Deployment: $INSTALL_DIR"
@@ -596,6 +602,7 @@ if [ "$RECONFIGURE" -eq 0 ] && [ -z "$UPSTREAM" ] && [ -z "$MODEL" ]; then
 fi
 choose_server
 resolve_settings
+check_identity
 detect_gpu
 write_config
 

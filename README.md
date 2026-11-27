@@ -111,7 +111,9 @@ Requirements:
   `curl`, `ss` (iproute2) and the usual coreutils. Run the script as root or as a
   member of the `docker` group; process names in the server list require root.
 - Outbound HTTPS to the relay, the identity provider, and optionally the Hugging Face
-  hub. If the GHCR packages are private, run `docker login ghcr.io` first.
+  hub. The device-flow client must be public (`token_endpoint_auth_method=none`) and
+  carry the `tunnel:serve` scope; a confidential client is refused with `invalid_client`.
+  The script checks this before starting the agent.
 - An OpenAI-compatible inference server listening on a local TCP port. The script probes
   `/v1/models`; a single answer is selected automatically, several answers are shown as a
   numbered list.
@@ -119,12 +121,17 @@ Requirements:
   script refuses to continue if a GPU is present but the toolkit is not configured); AMD
   and Intel use `/dev/dri`. The `-gpu` image ships nvtop 3.4.
 
-The script accepts `--relay URL`, `--issuer URL`, `--client-id ID`, `--engine-key-file
-FILE` and `--install-dir DIR`; without `--relay` and `--issuer` it prompts, or reuses the
-existing `.env`. `--auto --model NAME` is the non-interactive form: it selects the server
-serving `NAME` and prints only the enrolment URL on stdout. Without `--model`, `--auto`
-accepts a single detected server and fails on an ambiguous host. `--dry-run` shows the
-generated files without changing the host.
+It defaults to the official endpoints: relay `https://relay.circle-cyber.com`,
+identity provider `https://auth.circle-cyber.com` and client id `reverse-agent`. Override
+them with `--relay`, `--issuer` and `--client-id`; an existing `.env` is reused. The
+engine key can be given with `--engine-key-file FILE`, `--secret KEY` or
+`AGENT_UPSTREAM_API_KEY`; prefer the file form, since `--secret` stays in the shell
+history and process list.
+
+`--auto --model NAME` is the non-interactive form: it selects the server serving `NAME`
+and prints only the enrolment URL on stdout. Without `--model`, `--auto` accepts a single
+detected server and fails on an ambiguous host. `--dry-run` shows the generated files
+without changing the host.
 
 The one-command path requires an OpenAI-compatible engine already running. It does not
 install an engine, Docker or the NVIDIA Container Toolkit. See the manual quickstart
@@ -133,7 +140,6 @@ below for a pre-written compose file.
 ## Quickstart (container)
 
 ```bash
-docker login ghcr.io
 cp deploy/agent/.env.example deploy/agent/.env   # then edit it
 mkdir -p deploy/agent/secrets
 install -m 600 /dev/stdin deploy/agent/secrets/upstream_api_key <<< "$ENGINE_KEY"
