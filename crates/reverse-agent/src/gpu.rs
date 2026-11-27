@@ -1,13 +1,16 @@
-//! Reads GPU load from `nvtop -s`, the JSON snapshot of the NVTOP monitor.
+//! Reads GPU load and the processes holding each GPU from `nvtop -s`, the JSON snapshot of the
+//! NVTOP monitor.
 //!
 //! One tool covers NVIDIA (x86 and ARM), AMD and Intel with one format. The agent runs the
-//! first `nvtop` on its `PATH`: a natively installed agent therefore uses the host's tool, and
-//! the GPU image uses the one it ships. A container cannot borrow the host's binary, which is
-//! linked against the host's libraries.
+//! first `nvtop` on its `PATH`: the agent image ships the one it needs, and a natively installed
+//! agent uses the host's. A container cannot borrow the host's binary, which is linked against
+//! the host's libraries.
 //!
-//! The figures are device-wide, so a container reports the same values as the host. The
-//! per-process part of the snapshot is dropped unread: it carries full command lines. Two
-//! values are deliberately not taken at face value:
+//! The figures are device-wide. The processes are visible only when the agent shares the host's
+//! PID namespace (`pid: host`); otherwise the list is empty. A process is named from
+//! `/proc/<pid>/comm`, the kernel's executable name, and the command line that nvtop also
+//! prints is never deserialized: it can carry secrets such as `--api-key`. Two values are
+//! deliberately not taken at face value:
 //!
 //! - `mem_util` is the memory controller activity on NVIDIA with nvtop before 3.3, not the
 //!   memory in use. Memory use is computed from `mem_used` and `mem_total` only, so an old
@@ -15,17 +18,21 @@
 //! - On a unified-memory GB10 the snapshot's memory is derived from the GPU processes the
 //!   caller can see, which is nothing inside a container. The system memory share stands in.
 
+use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
 use std::time::Duration;
 
-use reverse_core::status::{GpuStatus, UNKNOWN, UNKNOWN_F64};
+use reverse_core::status::{GpuProcess, GpuStatus, UNKNOWN, UNKNOWN_F64};
 use serde::Deserialize;
 use tokio::process::Command;
 
 const NVTOP: &str = "nvtop";
+const SEARCH_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 const BUDGET: Duration = Duration::from_secs(4);
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_NAME_CHARS: usize = 64;
+const MIB: u64 = 1024 * 1024;
 
 /// Snapshots every GPU the process can see.
 ///
@@ -33,7 +40,21 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// optional, and the caller asks again so a driver that comes up late is picked up.
 pub async fn read(unified_memory: bool, host_memory_percent: i32) -> Vec<GpuStatus> {
     match snapshot().await {
-        Ok(json) => parse(&json, unified_memory, host_memory_percent),
+        Ok(json) => match decode(&json) {
+            Some(devices) => {
+                let pids: Vec<u32> = devices
+                    .iter()
+                    .flat_map(|device| &device.processes)
+                    .filter_map(|process| process.pid.trim().parse().ok())
+                    .collect();
+                let names = process_names(pids).await;
+                to_status(devices, unified_memory, host_memory_percent, &names)
+            }
+            None => {
+                tracing::debug!("gpu.nvtop_unparsable");
+                Vec::new()
+            }
+        },
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             tracing::debug!("gpu.nvtop_absent");
             Vec::new()
@@ -47,10 +68,13 @@ pub async fn read(unified_memory: bool, host_memory_percent: i32) -> Vec<GpuStat
 
 async fn snapshot() -> io::Result<String> {
     let mut command = Command::new(NVTOP);
-    // The agent's environment holds its credentials; the tool needs none of it.
+    // The agent's environment holds its credentials; the tool needs none of it. The search path
+    // is set explicitly: without it the lookup falls back to /bin:/usr/bin, which misses the
+    // /usr/local/bin install of the agent image.
     command
         .arg("-s")
         .env_clear()
+        .env("PATH", SEARCH_PATH)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
@@ -66,7 +90,7 @@ async fn snapshot() -> io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// The fields of one device that are used; every other key, `processes` included, is skipped.
+/// The fields of one device that are used; every other key is skipped, `cmdline` included.
 #[derive(Deserialize)]
 struct Device {
     device_name: String,
@@ -75,13 +99,40 @@ struct Device {
     gpu_util: Option<String>,
     mem_used: Option<String>,
     mem_total: Option<String>,
+    #[serde(default)]
+    processes: Vec<Process>,
 }
 
-fn parse(json: &str, unified_memory: bool, host_memory_percent: i32) -> Vec<GpuStatus> {
-    let Ok(devices) = serde_json::from_str::<Vec<Device>>(json) else {
-        tracing::debug!("gpu.nvtop_unparsable");
-        return Vec::new();
-    };
+#[derive(Deserialize)]
+struct Process {
+    pid: String,
+    gpu_mem_bytes_alloc: Option<String>,
+}
+
+fn decode(json: &str) -> Option<Vec<Device>> {
+    serde_json::from_str(json).ok()
+}
+
+/// Names the processes from the kernel's `comm`, read in one blocking pass off the runtime.
+async fn process_names(pids: Vec<u32>) -> HashMap<u32, String> {
+    tokio::task::spawn_blocking(move || {
+        pids.into_iter()
+            .filter_map(|pid| {
+                let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+                Some((pid, clean_name(&comm)?))
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn to_status(
+    devices: Vec<Device>,
+    unified_memory: bool,
+    host_memory_percent: i32,
+    names: &HashMap<u32, String>,
+) -> Vec<GpuStatus> {
     devices
         .into_iter()
         .map(|device| {
@@ -91,6 +142,11 @@ fn parse(json: &str, unified_memory: bool, host_memory_percent: i32) -> Vec<GpuS
                     .device_name
                     .chars()
                     .filter(|c| !c.is_control())
+                    .collect(),
+                processes: device
+                    .processes
+                    .iter()
+                    .filter_map(|process| process_of(process, names))
                     .collect(),
                 utilization_percent: percent(device.gpu_util.as_deref()),
                 memory_used_percent: if unified_memory {
@@ -106,6 +162,35 @@ fn parse(json: &str, unified_memory: bool, host_memory_percent: i32) -> Vec<GpuS
             }
         })
         .collect()
+}
+
+fn process_of(raw: &Process, names: &HashMap<u32, String>) -> Option<GpuProcess> {
+    let pid: u32 = raw.pid.trim().parse().ok()?;
+    Some(GpuProcess {
+        pid,
+        name: names.get(&pid).cloned(),
+        memory_mib: memory_mib(raw.gpu_mem_bytes_alloc.as_deref()),
+    })
+}
+
+/// Keeps the printable part of a kernel name, bounded for display.
+fn clean_name(comm: &str) -> Option<String> {
+    let name: String = comm
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NAME_CHARS)
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Parses a byte count such as `"3036069888"`; nvtop writes other units for some cards, which
+/// are unknown rather than guessed.
+fn memory_mib(raw: Option<&str>) -> i32 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(UNKNOWN, |bytes| {
+            i32::try_from(bytes / MIB).unwrap_or(i32::MAX)
+        })
 }
 
 /// Parses `"36C"`, `"6W"`, `"2%"`; `null`, `"N/A"` and out-of-range values are unknown.
@@ -186,6 +271,15 @@ mod tests {
     const AMD_3_2: &str = r#"[{"device_name": "AMD Radeon Graphics", "gpu_clock": "607MHz",
    "temp": "29C", "fan_speed": "CPU Fan", "power_draw": "4W", "gpu_util": "0%", "mem_util": "3%"}]"#;
 
+    fn parse(json: &str, unified: bool, host: i32) -> Vec<GpuStatus> {
+        to_status(
+            decode(json).expect("fixture decodes"),
+            unified,
+            host,
+            &HashMap::new(),
+        )
+    }
+
     #[test]
     fn a_unified_memory_gpu_reports_the_system_memory_share_not_the_process_sum() {
         let gpus = parse(GB10_3_4, true, 41);
@@ -245,7 +339,66 @@ mod tests {
 
     #[test]
     fn output_that_is_not_a_device_list_yields_no_gpu() {
-        assert!(parse("No GPU to monitor.", false, 0).is_empty());
+        assert!(decode("No GPU to monitor.").is_none());
         assert!(parse("[]", false, 0).is_empty());
+    }
+
+    #[test]
+    fn a_process_is_named_from_its_kernel_name_and_its_memory_is_in_mib() {
+        let names = HashMap::from([(1_336_019, "llama-server".to_owned())]);
+        let gpus = to_status(decode(GB10_3_4).unwrap(), true, 41, &names);
+        assert_eq!(
+            gpus[0].processes,
+            vec![GpuProcess {
+                pid: 1_336_019,
+                name: Some("llama-server".to_owned()),
+                memory_mib: 2895,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_command_line_never_reaches_the_status() {
+        let names = HashMap::from([(1_336_019, "llama-server".to_owned())]);
+        let gpus = to_status(decode(GB10_3_4).unwrap(), true, 41, &names);
+        let json = serde_json::to_string(&gpus).unwrap();
+        assert!(!json.contains("api-key"));
+        assert!(!json.contains("--host"));
+    }
+
+    #[test]
+    fn a_process_without_a_readable_name_or_memory_is_kept_with_unknowns() {
+        let gpus = to_status(
+            decode(
+                r#"[{"device_name":"X","processes":[{"pid":"42","cmdline":null,"gpu_mem_bytes_alloc":"0.01 MiB"}]}]"#,
+            )
+            .unwrap(),
+            false,
+            0,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            gpus[0].processes,
+            vec![GpuProcess {
+                pid: 42,
+                name: None,
+                memory_mib: UNKNOWN,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_device_without_processes_has_an_empty_list() {
+        assert!(parse(RTX4090_3_2, false, 0)[0].processes.is_empty());
+    }
+
+    #[test]
+    fn kernel_names_drop_control_characters_and_are_bounded() {
+        assert_eq!(
+            clean_name("llama-server\n").as_deref(),
+            Some("llama-server")
+        );
+        assert_eq!(clean_name("\n").as_deref(), None);
+        assert_eq!(clean_name(&"x".repeat(200)).unwrap().chars().count(), 64);
     }
 }

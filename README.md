@@ -73,9 +73,9 @@ flowchart LR
   path segment can occupy.
 - Request bodies are bounded (64 MiB default) with idle stall guards in both
   directions.
-- The runtime image is `scratch`, non-root (UID/GID 65532), read-only, with no
-  shell, no package manager, `cap_drop: ALL` and `no-new-privileges`. The optional
-  `-gpu` image trades `scratch` for Debian 13 slim to carry nvtop (AGENTS.md, E3).
+- The runtime images are non-root (UID/GID 65532), read-only, with no shell, no
+  package manager, `cap_drop: ALL` and `no-new-privileges`. The agent runs on
+  distroless glibc to carry nvtop; the relay stays on `scratch` (AGENTS.md, E3).
 
 ## Requirements
 
@@ -90,10 +90,80 @@ flowchart LR
   (`AGENT_HF_URL`) for tags and public owner metadata. Set it to `false` to
   keep model ids on the box; `HTTPS_PROXY`/`NO_PROXY` are honored for this lookup.
 
+## One-command install
+
+`deploy.sh` is attached to each release. It checks the host, finds the local
+OpenAI-compatible servers, asks which one to expose when several are running, writes
+`compose.yml` and `.env`, pulls the image, starts the agent and prints the device-flow
+link.
+
+```bash
+curl -fsSL https://github.com/circle-rd/ai-reverse/releases/latest/download/deploy.sh -o deploy.sh
+chmod +x deploy.sh
+sudo ./deploy.sh
+```
+
+Requirements:
+
+- Linux on `amd64` or `arm64`; Ubuntu and Debian are tested, and another Linux with
+  Docker works as long as the script's tools are present.
+- Docker Engine 20.10 or newer with the Compose v2 plugin (2.20 or newer), and
+  `curl`, `ss` (iproute2) and the usual coreutils. Run the script as root or as a
+  member of the `docker` group; process names in the server list require root.
+- Outbound HTTPS to the relay, the identity provider, and optionally the Hugging Face
+  hub. The device-flow client must be public (`token_endpoint_auth_method=none`) and
+  carry the `tunnel:serve` scope; a confidential client is refused with `invalid_client`.
+  The script checks this before starting the agent.
+- An OpenAI-compatible inference server listening on a local TCP port. The script probes
+  `/v1/models`; a single answer is selected automatically, several answers are shown as a
+  numbered list.
+- GPU metrics are optional. NVIDIA needs the NVIDIA Container Toolkit on the host (the
+  script refuses to continue if a GPU is present but the toolkit is not configured); AMD
+  and Intel use `/dev/dri`. The agent image ships nvtop 3.4.
+
+It defaults to the official endpoints: relay `https://relay.circle-cyber.com`,
+identity provider `https://auth.circle-cyber.com` and client id `reverse-agent`. Override
+them with `--relay`, `--issuer` and `--client-id`; an existing `.env` is reused. The
+engine key can be given with `--engine-key-file FILE`, `--secret KEY` or
+`AGENT_UPSTREAM_API_KEY`; prefer the file form, since `--secret` stays in the shell
+history and process list.
+
+`--auto --model NAME` is the non-interactive form: it selects the server serving `NAME`
+and prints only the enrolment URL on stdout. Without `--model`, `--auto` accepts a single
+detected server and fails on an ambiguous host. `--dry-run` shows the generated files
+without changing the host.
+
+The one-command path requires an OpenAI-compatible engine already running. It does not
+install an engine, Docker or the NVIDIA Container Toolkit. See the manual quickstart
+below for a pre-written compose file.
+
+### User service
+
+By default the deployment is a Compose project with `restart: unless-stopped`; no
+systemd unit is installed. `--user-service` installs `raiversed-agent.service` in the
+current user's systemd manager:
+
+```bash
+./deploy.sh --user-service --auto --model qwen3.8-27b
+```
+
+Run it as the target user, never with `sudo`. The unit lives in
+`~/.config/systemd/user/raiversed-agent.service`, is enabled in `default.target`, and
+starts the Compose project in the foreground. `loginctl enable-linger` is attempted so
+the service starts at boot without a login; if polkit refuses it, the service starts at
+login only and a one-time `sudo loginctl enable-linger "$USER"` is needed. Manage it with
+`systemctl --user status raiversed-agent.service` and
+`journalctl --user -u raiversed-agent.service`.
+
+This is user-only for systemd and for the deployment files, but Docker access still
+comes from the `docker` group, which is root-equivalent on the host. A fully rootless
+Docker daemon is a different setup: `network_mode: host` and GPU access are not
+validated in that mode, so a GPU node should use a user in the `docker` group or a
+system-wide service.
+
 ## Quickstart (container)
 
 ```bash
-docker login ghcr.io
 cp deploy/agent/.env.example deploy/agent/.env   # then edit it
 mkdir -p deploy/agent/secrets
 install -m 600 /dev/stdin deploy/agent/secrets/upstream_api_key <<< "$ENGINE_KEY"
@@ -170,7 +240,7 @@ Required settings have no silent defaults. Supplying both `KEY` and
 | `AGENT_MAX_REQUEST_BYTES` | no | Largest request body accepted. Default 67108864. |
 | `AGENT_INSECURE_TRANSPORT` | no | Allow plain HTTP to a non-loopback relay. Default `false`. |
 | `AGENT_EXTRA_MODELS` | no | Comma-separated ids announced in addition to the engine's `/v1/models`. |
-| `AGENT_MODEL_TAGS` | no | `model=tag[,tag][;…]`; overrides hub metadata for the named models. |
+| `AGENT_MODEL_TAGS` | no | `model=tag[,tag][;…]`; optional override that replaces every detected tag for the named models. |
 | `AGENT_HF_METADATA` | no | `true`/`false`: consult the hub for model capabilities, author claims and public owner avatars. Default `true`. |
 | `AGENT_HF_URL` | no | Hub origin; `https` unless loopback. Default `https://huggingface.co`. |
 | `AGENT_HF_TOKEN` | no | Token for gated or private hub repositories. |
@@ -278,11 +348,23 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
 - **Discovery.** The agent polls the engine's `/v1/models`. Engines commonly
   omit auxiliary lanes: `AGENT_EXTRA_MODELS` announces ids such as an embedding
   model the engine serves on `/v1/embeddings` without listing it.
-- **Classification.** The agent merges three sources, in order: the operator's
-  `AGENT_MODEL_TAGS`, the capability hints the engine reports in each
+- **Classification.** The agent merges four sources: the capabilities the engine
+  declares on its own endpoints, the capability hints it reports in each
   `/v1/models` entry (`capabilities` or `tags`, including
-  `input_modalities`/`output_modalities`), and the Hugging Face model API's
-  `pipeline_tag` and `tags`. Typical hub mappings are `feature-extraction` →
+  `input_modalities`/`output_modalities`), the Hugging Face model API's
+  `pipeline_tag` and `tags`, and the operator's `AGENT_MODEL_TAGS` override.
+  The engine is recognised by the endpoint it answers, once per announced set of
+  ids; nothing is inferred from a name:
+
+  | Engine | Endpoint | Tags read |
+  | --- | --- | --- |
+  | Ollama | `GET /api/tags`, then `POST /api/show` per model | the `capabilities` list: `completion` → `text`, `tools`, `vision`, `embedding`, `audio` → `speech`, … |
+  | SGLang | `GET /model_info`, or `/get_model_info` | `is_generation` → `text` or `embedding`; `has_image_understanding` → `vision`; `has_audio_understanding` → `speech` |
+  | llama.cpp | `GET /props` | `modalities` (`vision`, `audio`, `video`); a `chat_template` → `text`; `chat_template_caps.supports_tools` → `tools` |
+  | vLLM | none | nothing: the hub or the override decides |
+
+  The engine facts describe the one model SGLang or llama.cpp serves, so they apply
+  to every id it announces. Typical hub mappings are `feature-extraction` →
   `embedding`, `text-generation` → `text`, `image-text-to-text` → `text` +
   `vision`, `text-to-image` → `image`, `automatic-speech-recognition` →
   `speech`, and `text-ranking` → `rerank`. Results are cached; unknown or
@@ -300,17 +382,17 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
   exposed as `model_info.author_safety_claim` (`uncensored`, `abliterated`, or
   `uncensored-and-abliterated`). These are author-declared labels, not a safety
   evaluation; absent tags remain unknown, and names are never used to guess.
-- **Override.** `AGENT_MODEL_TAGS` supplies capability tags for ids unknown to
-  the engine and hub, and corrects known ids for facts they do not report, like
-  tool calling:
+- **Override.** `AGENT_MODEL_TAGS` is optional. When set for a model it replaces
+  every detected tag of that model, for ids the engine and hub do not classify, or
+  to correct a fact the server does not report:
 
   ```bash
   AGENT_EXTRA_MODELS=perplexity-ai/pplx-embed-v1-0.6b
   AGENT_MODEL_TAGS=qwen3.8-flash-next=text,tools
   ```
 
-- A model with no source and no operator declaration carries **no** tags; the
-  agent logs `models.tags_unknown` instead of guessing.
+- A model with no source, no engine endpoint and no override carries **no** tags;
+  the agent logs `models.tags_unknown` instead of guessing.
 - The relay publishes tags in `model_info.tags`, owner data in
   `model_info.hub_owner` and `model_info.hub_avatar_url`, and author claims in
   `model_info.author_safety_claim`. It maps capability tags to LiteLLM fields:
@@ -356,7 +438,7 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
     Without engine metrics the load falls back to the requests crossing the agent.
   - **GPU figures** come from `nvtop -s` (NVIDIA on x86 and ARM, AMD, Intel), run by
     the agent with an empty environment. It uses the first `nvtop` on its `PATH`: an
-    agent installed natively uses the host's, and the `-gpu` image uses the 3.4.0 it
+    agent installed natively uses the host's, and the container image uses the 3.4.0 it
     ships (below). A container cannot borrow the host's binary, which is linked
     against the host's libraries. Without `nvtop`, or without GPU access, `gpus` is
     empty. Values are device-wide, so a container reports what the host would, with
@@ -365,6 +447,11 @@ downstream consumers (LiteLLM, dashboards, SDKs) use to classify it.
     nvtop gives `-1` rather than a wrong number; and on a unified-memory GB10 the
     memory share is the system memory share (`memoryShared`), because the snapshot's
     own figure only counts the GPU processes the caller can see.
+    Each GPU also lists the processes holding its memory (`processes`: `pid`, kernel
+    executable `name` from `/proc/<pid>/comm`, `memoryMib`). The command line is never
+    read, since it can carry secrets. The list is visible only when the agent shares
+    the host's PID namespace (`pid: host`) and the GPU is passed through the NVIDIA
+    container toolkit (`--gpus`); otherwise it is empty.
 - Changing tags, owner, avatar, author claim, capability flags or hardware replaces the
   deployment on the next reconcile: LiteLLM has no partial `model_info` update,
   so the old row is deleted and recreated with the new metadata.
@@ -399,7 +486,6 @@ the box.
 ## Container images
 
 The workflows publish `ghcr.io/circle-rd/ai-reverse-agent` (`Dockerfile`),
-`ghcr.io/circle-rd/ai-reverse-agent-gpu` (`Dockerfile`, target `gpu`) and
 `ghcr.io/circle-rd/ai-reverse-relay` (`Dockerfile.relay`) for `linux/amd64` and
 `linux/arm64`:
 
@@ -410,15 +496,19 @@ The workflows publish `ghcr.io/circle-rd/ai-reverse-agent` (`Dockerfile`),
 
 Pin the image by digest in production.
 
-### GPU image
+### Agent image
 
-`ai-reverse-agent-gpu` is the same agent on Debian 13 slim next to nvtop 3.4.0 (built
-from a pinned, checksummed release; GPL-3, licence and source pointer in
+`ai-reverse-agent` runs the agent on distroless glibc next to nvtop 3.4.0 (built from a
+pinned, checksummed release; GPL-3, licence and source pointer in
 `/usr/share/doc/nvtop`), so the status carries GPU load, memory, temperature and power
-(AGENTS.md, exception E3). It keeps the non-root user, read-only root and
-`cap_drop: ALL`. Give it the GPU with `gpus: all` (the image already sets
-`NVIDIA_DRIVER_CAPABILITIES=utility`); for an AMD or Intel GPU pass `/dev/dri` and the
-`render` group instead. See `deploy/agent/compose.example.yml`.
+(AGENTS.md, exception E3). It has no shell and no package manager, and keeps the
+non-root user, read-only root and `cap_drop: ALL`. Give it the GPU with `gpus: all` (the
+image already sets `NVIDIA_DRIVER_CAPABILITIES=utility`); for an AMD or Intel GPU pass
+`/dev/dri` and the `render` group instead. Add `pid: host` so nvtop lists the GPU
+processes of the host. The NVIDIA container toolkit must be installed on the host: it
+injects the driver libraries that nvtop reads, they are not in the image. Without a GPU
+the same image runs, and the GPU figures stay empty. See
+`deploy/agent/compose.example.yml`.
 
 ## Run with Cargo
 

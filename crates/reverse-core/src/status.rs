@@ -111,12 +111,27 @@ pub struct HostStatus {
     pub cpu_temperature_c: i32,
 }
 
+/// A process holding memory on one GPU.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuProcess {
+    /// Process id on the host.
+    pub pid: u32,
+    /// Executable name as the kernel records it (at most 15 characters); never the command line.
+    pub name: Option<String>,
+    /// GPU memory the process holds in MiB, or [`UNKNOWN`].
+    pub memory_mib: i32,
+}
+
 /// Load of one GPU.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GpuStatus {
     /// Name the driver reports.
     pub name: String,
+    /// Processes the driver lists on this GPU; empty when the agent cannot see them.
+    #[serde(default)]
+    pub processes: Vec<GpuProcess>,
     /// Compute utilisation, 0 to 100, or [`UNKNOWN`].
     pub utilization_percent: i32,
     /// Memory in use, 0 to 100, or [`UNKNOWN`]. On a unified-memory machine this is the share of

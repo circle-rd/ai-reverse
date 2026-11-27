@@ -14,11 +14,14 @@ use serde::Deserialize;
 use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 
+use crate::capabilities;
 use crate::catalog::Catalog;
 use crate::error::DiscoveryError;
 use crate::upstream::Upstream;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on the engine probes of one poll; what does not fit is asked again next cycle.
+const PROBE_BUDGET: Duration = Duration::from_secs(5);
 const MAX_MODEL_LIST_BYTES: usize = 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -73,15 +76,26 @@ pub async fn run(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut resolved: BTreeMap<ModelName, ModelMetadata> = BTreeMap::new();
     let mut unknown = HashSet::new();
+    let mut probes = capabilities::Memo::default();
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
             () = triggered(&mut shutdown) => return,
         }
-        let outcome = match tokio::time::timeout(FETCH_TIMEOUT, fetch(&upstream)).await {
+        let mut outcome = match tokio::time::timeout(FETCH_TIMEOUT, fetch(&upstream)).await {
             Ok(result) => result,
             Err(_) => Err(DiscoveryError::Timeout(FETCH_TIMEOUT)),
         };
+        match &mut outcome {
+            Ok(engine) => {
+                for (name, tags) in
+                    capabilities::read(&upstream, &engine.ids, &mut probes, PROBE_BUDGET).await
+                {
+                    engine.hints.entry(name).or_default().extend(tags);
+                }
+            }
+            Err(_) => probes.reset(),
+        }
         if let Ok(engine) = &outcome {
             let fresh = resolve_pass(
                 &engine.ids,
@@ -142,7 +156,7 @@ async fn resolve_pass(
                     if !has_hints && unknown.insert(name.clone()) {
                         tracing::warn!(
                             model = %name,
-                            "models.tags_unknown; declare AGENT_MODEL_TAGS to classify it"
+                            "models.tags_unknown; no engine or hub tag, declare AGENT_MODEL_TAGS to classify it"
                         );
                     }
                 }

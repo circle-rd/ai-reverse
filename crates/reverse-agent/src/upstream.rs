@@ -9,7 +9,7 @@ use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
-use reverse_core::body::{ProxyBody, empty};
+use reverse_core::body::{ProxyBody, empty, full};
 use reverse_core::secret::SecretString;
 
 use crate::config::Config;
@@ -76,10 +76,45 @@ impl Upstream {
         max_bytes: usize,
         budget: Duration,
     ) -> Result<(StatusCode, String), UpstreamError> {
+        self.exchange(
+            Method::GET,
+            path,
+            HeaderMap::new(),
+            empty(),
+            max_bytes,
+            budget,
+        )
+        .await
+    }
+
+    /// Posts a JSON body and reads a small text answer within `budget`.
+    pub async fn post_json_text(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        max_bytes: usize,
+        budget: Duration,
+    ) -> Result<(StatusCode, String), UpstreamError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+        self.exchange(Method::POST, path, headers, full(body), max_bytes, budget)
+            .await
+    }
+
+    async fn exchange(
+        &self,
+        method: Method,
+        path: &str,
+        headers: HeaderMap,
+        body: ProxyBody,
+        max_bytes: usize,
+        budget: Duration,
+    ) -> Result<(StatusCode, String), UpstreamError> {
         let read = async {
-            let response = self
-                .send(Method::GET, path, HeaderMap::new(), empty())
-                .await?;
+            let response = self.send(method, path, headers, body).await?;
             let status = response.status();
             let bytes = Limited::new(response.into_body(), max_bytes)
                 .collect()
